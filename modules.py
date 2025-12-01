@@ -13,15 +13,17 @@ from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
                                QGraphicsRectItem, QTabWidget)
 from PySide6.QtCore import Qt, QPointF, QRectF, Signal, QThread
 from PySide6.QtGui import QPixmap, QImage, QPen, QColor, QBrush
-from sqlalchemy import create_engine, Column, Integer, String, Float, ForeignKey
+from sqlalchemy import create_engine, Column, Integer, String, Float, ForeignKey, Boolean, DateTime
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
+from apscheduler.triggers.date import DateTrigger
 import subprocess
 import uuid
 import pandas as pd
+import datetime
 
 # ============================================================================
 # DATABASE SETUP
@@ -51,6 +53,24 @@ class Field(Base):
     width = Column(Float)
     height = Column(Float)
     template = relationship("Template", back_populates="fields")
+
+class Job(Base):
+    __tablename__ = "jobs"
+    id = Column(Integer, primary_key=True)
+    name = Column(String)
+    script_path = Column(String)
+    job_type = Column(String)  # 'one_time' or 'recurring'
+    run_date = Column(DateTime, nullable=True)  # For one-time jobs
+    recurrence = Column(String, nullable=True)  # 'daily', 'weekly', 'monthly', 'interval'
+    interval_seconds = Column(Integer, nullable=True)
+    cron_expression = Column(String, nullable=True)
+    recurrence_time = Column(String, nullable=True)  # Time of day for daily/weekly/monthly (HH:MM)
+    day_of_week = Column(String, nullable=True)  # For weekly (e.g., "0,2,4" for Mon/Wed/Fri)
+    day_of_month = Column(Integer, nullable=True)  # For monthly
+    last_run = Column(DateTime, nullable=True)
+    next_run = Column(DateTime, nullable=True)
+    enabled = Column(Boolean, default=True)
+    misfire_grace_time = Column(Integer, default=300)  # 5 minutes default
 
 Base.metadata.create_all(engine)
 
@@ -864,8 +884,9 @@ class SchedulerModule(QWidget):
         super().__init__()
         self.scheduler = BackgroundScheduler()
         self.scheduler.start()
-        self.jobs = {}
         self.setup_ui()
+        self.load_jobs_from_db()
+        self.check_missed_jobs()
     
     def setup_ui(self):
         layout = QVBoxLayout(self)
@@ -880,67 +901,394 @@ class SchedulerModule(QWidget):
         btn_add.clicked.connect(self.add_job_dialog)
         layout.addWidget(btn_add)
         
-        self.job_list = QListWidget()
-        layout.addWidget(self.job_list)
+        self.job_table = QTableWidget(0, 5)
+        self.job_table.setHorizontalHeaderLabels(["Name", "Type", "Next Run", "Status", "Actions"])
+        self.job_table.horizontalHeader().setStretchLastSection(True)
+        layout.addWidget(self.job_table)
+    
+    def load_jobs_from_db(self):
+        """Load all jobs from database and add to scheduler"""
+        session = SessionLocal()
+        jobs = session.query(Job).all()
         
-        btn_delete = QPushButton("🗑️ Delete Selected")
-        btn_delete.clicked.connect(self.delete_job)
-        layout.addWidget(btn_delete)
+        for job_db in jobs:
+            if job_db.enabled:
+                self.schedule_job(job_db)
+        
+        session.close()
+        self.refresh_job_list()
+    
+    def check_missed_jobs(self):
+        """Check for and execute missed jobs on startup"""
+        session = SessionLocal()
+        now = datetime.datetime.now()
+        
+        jobs = session.query(Job).filter(Job.enabled == True, Job.next_run != None).all()
+        
+        for job_db in jobs:
+            if job_db.next_run < now:
+                # Job was missed
+                grace = datetime.timedelta(seconds=job_db.misfire_grace_time)
+                if now - job_db.next_run <= grace:
+                    print(f"Executing missed job: {job_db.name}")
+                    self.execute_job(job_db)
+        
+        session.close()
+    
+    def schedule_job(self, job_db):
+        """Add job to APScheduler based on database record"""
+        job_id = f"job_{job_db.id}"
+        
+        try:
+            if job_db.job_type == "one_time":
+                trigger = DateTrigger(run_date=job_db.run_date)
+            elif job_db.job_type == "recurring":
+                if job_db.recurrence == "interval":
+                    trigger = IntervalTrigger(seconds=job_db.interval_seconds)
+                elif job_db.recurrence == "daily":
+                    h, m = map(int, job_db.recurrence_time.split(":"))
+                    trigger = CronTrigger(hour=h, minute=m)
+                elif job_db.recurrence == "weekly":
+                    h, m = map(int, job_db.recurrence_time.split(":"))
+                    trigger = CronTrigger(day_of_week=job_db.day_of_week, hour=h, minute=m)
+                elif job_db.recurrence == "monthly":
+                    h, m = map(int, job_db.recurrence_time.split(":"))
+                    trigger = CronTrigger(day=job_db.day_of_month, hour=h, minute=m)
+                else:
+                    return
+            else:
+                return
+            
+            self.scheduler.add_job(
+                lambda: self.execute_job_by_id(job_db.id),
+                trigger,
+                id=job_id,
+                name=job_db.name,
+                misfire_grace_time=job_db.misfire_grace_time
+            )
+            
+            # Update next_run in database
+            job = self.scheduler.get_job(job_id)
+            if job:
+                session = SessionLocal()
+                db_job = session.query(Job).get(job_db.id)
+                db_job.next_run = job.next_run_time
+                session.commit()
+                session.close()
+                
+        except Exception as e:
+            print(f"Error scheduling job {job_db.name}: {e}")
+    
+    def execute_job_by_id(self, job_id):
+        """Execute job by database ID"""
+        session = SessionLocal()
+        job_db = session.query(Job).get(job_id)
+        if job_db:
+            self.execute_job(job_db)
+        session.close()
+    
+    def execute_job(self, job_db):
+        """Execute the job script"""
+        try:
+            result = subprocess.run(job_db.script_path, shell=True, capture_output=True, text=True)
+            print(f"Job '{job_db.name}' executed. Return code: {result.returncode}")
+            
+            # Update last_run
+            session = SessionLocal()
+            db_job = session.query(Job).get(job_db.id)
+            db_job.last_run = datetime.datetime.now()
+            
+            # For one-time jobs, disable after execution
+            if job_db.job_type == "one_time":
+                db_job.enabled = False
+                # Remove from scheduler
+                try:
+                    self.scheduler.remove_job(f"job_{job_db.id}")
+                except:
+                    pass
+            
+            session.commit()
+            session.close()
+            self.refresh_job_list()
+            
+        except Exception as e:
+            print(f"Job '{job_db.name}' failed: {e}")
     
     def add_job_dialog(self):
+        """Enhanced dialog for adding jobs"""
+        from PySide6.QtWidgets import QDateTimeEdit, QRadioButton, QButtonGroup, QCheckBox
+        
         dialog = QDialog(self)
         dialog.setWindowTitle("Add Job")
+        dialog.resize(500, 600)
         layout = QVBoxLayout(dialog)
         
+        # Job Name
+        layout.addWidget(QLabel("Job Name:"))
         name_input = QLineEdit()
-        name_input.setPlaceholderText("Job Name")
         layout.addWidget(name_input)
         
+        # Script Path
+        layout.addWidget(QLabel("Script Path:"))
+        script_layout = QHBoxLayout()
         script_input = QLineEdit()
-        script_input.setPlaceholderText("Script Path")
         btn_browse = QPushButton("Browse...")
         btn_browse.clicked.connect(lambda: script_input.setText(
             QFileDialog.getOpenFileName(dialog, "Select Script")[0]))
-        layout.addWidget(script_input)
-        layout.addWidget(btn_browse)
+        script_layout.addWidget(script_input)
+        script_layout.addWidget(btn_browse)
+        layout.addLayout(script_layout)
         
-        interval_input = QSpinBox()
-        interval_input.setRange(1, 3600)
-        interval_input.setValue(60)
-        interval_input.setSuffix(" seconds")
-        layout.addWidget(QLabel("Interval:"))
-        layout.addWidget(interval_input)
+        # Job Type
+        layout.addWidget(QLabel("Job Type:"))
+        type_group = QButtonGroup(dialog)
+        radio_onetime = QRadioButton("One-Time")
+        radio_recurring = QRadioButton("Recurring")
+        radio_onetime.setChecked(True)
+        type_group.addButton(radio_onetime)
+        type_group.addButton(radio_recurring)
+        type_layout = QHBoxLayout()
+        type_layout.addWidget(radio_onetime)
+        type_layout.addWidget(radio_recurring)
+        layout.addLayout(type_layout)
         
+        # One-Time Section
+        onetime_widget = QWidget()
+        onetime_layout = QVBoxLayout(onetime_widget)
+        onetime_layout.addWidget(QLabel("Run Date & Time:"))
+        datetime_picker = QDateTimeEdit()
+        datetime_picker.setDateTime(datetime.datetime.now() + datetime.timedelta(hours=1))
+        datetime_picker.setDisplayFormat("yyyy-MM-dd HH:mm")
+        onetime_layout.addWidget(datetime_picker)
+        layout.addWidget(onetime_widget)
+        
+        # Recurring Section
+        recurring_widget = QWidget()
+        recurring_layout = QVBoxLayout(recurring_widget)
+        
+        recurring_layout.addWidget(QLabel("Recurrence Type:"))
+        recurrence_combo = QComboBox()
+        recurrence_combo.addItems(["Interval", "Daily", "Weekly", "Monthly"])
+        recurring_layout.addWidget(recurrence_combo)
+        
+        # Interval settings
+        interval_widget = QWidget()
+        interval_layout = QHBoxLayout(interval_widget)
+        interval_layout.addWidget(QLabel("Every:"))
+        interval_spin = QSpinBox()
+        interval_spin.setRange(1, 86400)
+        interval_spin.setValue(60)
+        interval_layout.addWidget(interval_spin)
+        interval_unit = QComboBox()
+        interval_unit.addItems(["Seconds", "Minutes", "Hours"])
+        interval_unit.setCurrentText("Minutes")
+        interval_layout.addWidget(interval_unit)
+        recurring_layout.addWidget(interval_widget)
+        
+        # Time picker for daily/weekly/monthly
+        time_widget = QWidget()
+        time_layout = QHBoxLayout(time_widget)
+        time_layout.addWidget(QLabel("Time:"))
+        time_picker = QLineEdit()
+        time_picker.setText("09:00")
+        time_picker.setPlaceholderText("HH:MM")
+        time_layout.addWidget(time_picker)
+        recurring_layout.addWidget(time_widget)
+        
+        # Weekly: Day selection
+        weekly_widget = QWidget()
+        weekly_layout = QVBoxLayout(weekly_widget)
+        weekly_layout.addWidget(QLabel("Days of Week:"))
+        day_checks = []
+        day_names = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+        for i, day in enumerate(day_names):
+            cb = QCheckBox(day)
+            cb.setProperty("day_index", i)
+            day_checks.append(cb)
+            weekly_layout.addWidget(cb)
+        recurring_layout.addWidget(weekly_widget)
+        
+        # Monthly: Day of month
+        monthly_widget = QWidget()
+        monthly_layout = QHBoxLayout(monthly_widget)
+        monthly_layout.addWidget(QLabel("Day of Month:"))
+        day_spin = QSpinBox()
+        day_spin.setRange(1, 31)
+        day_spin.setValue(1)
+        monthly_layout.addWidget(day_spin)
+        recurring_layout.addWidget(monthly_widget)
+        
+        # Show/hide based on recurrence type
+        def update_recurrence_widgets():
+            rec_type = recurrence_combo.currentText()
+            interval_widget.setVisible(rec_type == "Interval")
+            time_widget.setVisible(rec_type in ["Daily", "Weekly", "Monthly"])
+            weekly_widget.setVisible(rec_type == "Weekly")
+            monthly_widget.setVisible(rec_type == "Monthly")
+        
+        recurrence_combo.currentTextChanged.connect(update_recurrence_widgets)
+        update_recurrence_widgets()
+        
+        layout.addWidget(recurring_widget)
+        recurring_widget.setVisible(False)
+        
+        # Toggle visibility based on job type
+        def update_job_type_widgets():
+            is_onetime = radio_onetime.isChecked()
+            onetime_widget.setVisible(is_onetime)
+            recurring_widget.setVisible(not is_onetime)
+        
+        radio_onetime.toggled.connect(update_job_type_widgets)
+        
+        # Misfire Grace Time
+        layout.addWidget(QLabel("Misfire Grace Time (minutes):"))
+        grace_spin = QSpinBox()
+        grace_spin.setRange(1, 1440)
+        grace_spin.setValue(5)
+        layout.addWidget(grace_spin)
+        
+        # Buttons
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.accepted.connect(dialog.accept)
         buttons.rejected.connect(dialog.reject)
         layout.addWidget(buttons)
         
         if dialog.exec() == QDialog.Accepted:
-            self.add_job(name_input.text(), script_input.text(), interval_input.value())
+            self.save_job(
+                name_input.text(),
+                script_input.text(),
+                radio_onetime.isChecked(),
+                datetime_picker.dateTime().toPython(),
+                recurrence_combo.currentText(),
+                interval_spin.value(),
+                interval_unit.currentText(),
+                time_picker.text(),
+                day_checks,
+                day_spin.value(),
+                grace_spin.value()
+            )
     
-    def add_job(self, name, script, interval):
+    def save_job(self, name, script, is_onetime, run_datetime, rec_type, 
+                 interval_val, interval_unit, rec_time, day_checks, day_of_month, grace_min):
+        """Save job to database and schedule it"""
         if not name or not script:
+            QMessageBox.warning(self, "Warning", "Name and script path are required")
             return
         
-        job_id = str(uuid.uuid4())
-        trigger = IntervalTrigger(seconds=interval)
+        session = SessionLocal()
         
-        def run_script():
-            try:
-                subprocess.run([script], shell=True, check=True)
-            except Exception as e:
-                print(f"Job {name} failed: {e}")
+        job_db = Job()
+        job_db.name = name
+        job_db.script_path = script
+        job_db.misfire_grace_time = grace_min * 60
         
-        self.scheduler.add_job(run_script, trigger, id=job_id, name=name)
-        self.jobs[job_id] = {"name": name, "script": script}
-        self.job_list.addItem(f"{name} - Every {interval}s")
-        QMessageBox.information(self, "Success", "Job added!")
+        if is_onetime:
+            job_db.job_type = "one_time"
+            job_db.run_date = run_datetime
+            job_db.next_run = run_datetime
+        else:
+            job_db.job_type = "recurring"
+            job_db.recurrence = rec_type.lower()
+            
+            if rec_type == "Interval":
+                multiplier = {"Seconds": 1, "Minutes": 60, "Hours": 3600}[interval_unit]
+                job_db.interval_seconds = interval_val * multiplier
+            elif rec_type in ["Daily", "Weekly", "Monthly"]:
+                job_db.recurrence_time = rec_time
+                
+                if rec_type == "Weekly":
+                    selected_days = [str(cb.property("day_index")) for cb in day_checks if cb.isChecked()]
+                    job_db.day_of_week = ",".join(selected_days)
+                elif rec_type == "Monthly":
+                    job_db.day_of_month = day_of_month
+        
+        session.add(job_db)
+        session.commit()
+        
+        # Schedule the job
+        self.schedule_job(job_db)
+        
+        session.close()
+        self.refresh_job_list()
+        QMessageBox.information(self, "Success", "Job added successfully!")
     
-    def delete_job(self):
-        if self.job_list.currentRow() >= 0:
-            index = self.job_list.currentRow()
-            job_id = list(self.jobs.keys())[index]
-            self.scheduler.remove_job(job_id)
-            del self.jobs[job_id]
-            self.job_list.takeItem(index)
+    def refresh_job_list(self):
+        """Refresh the job table"""
+        session = SessionLocal()
+        jobs = session.query(Job).all()
+        
+        self.job_table.setRowCount(len(jobs))
+        
+        for row, job in enumerate(jobs):
+            self.job_table.setItem(row, 0, QTableWidgetItem(job.name))
+            
+            job_type_str = "One-Time" if job.job_type == "one_time" else f"Recurring ({job.recurrence})"
+            self.job_table.setItem(row, 1, QTableWidgetItem(job_type_str))
+            
+            next_run_str = job.next_run.strftime("%Y-%m-%d %H:%M") if job.next_run else "N/A"
+            self.job_table.setItem(row, 2, QTableWidgetItem(next_run_str))
+            
+            status_str = "Enabled" if job.enabled else "Disabled"
+            self.job_table.setItem(row, 3, QTableWidgetItem(status_str))
+            
+            # Actions
+            actions_widget = QWidget()
+            actions_layout = QHBoxLayout(actions_widget)
+            actions_layout.setContentsMargins(0, 0, 0, 0)
+            
+            btn_toggle = QPushButton("Disable" if job.enabled else "Enable")
+            btn_toggle.clicked.connect(lambda checked, j=job: self.toggle_job(j.id))
+            btn_delete = QPushButton("Delete")
+            btn_delete.clicked.connect(lambda checked, j=job: self.delete_job(j.id))
+            
+            actions_layout.addWidget(btn_toggle)
+            actions_layout.addWidget(btn_delete)
+            
+            self.job_table.setCellWidget(row, 4, actions_widget)
+        
+        session.close()
+    
+    def toggle_job(self, job_id):
+        """Enable or disable a job"""
+        session = SessionLocal()
+        job = session.query(Job).get(job_id)
+        
+        if job:
+            job.enabled = not job.enabled
+            session.commit()
+            
+            scheduler_job_id = f"job_{job_id}"
+            if job.enabled:
+                self.schedule_job(job)
+            else:
+                try:
+                    self.scheduler.remove_job(scheduler_job_id)
+                except:
+                    pass
+        
+        session.close()
+        self.refresh_job_list()
+    
+    def delete_job(self, job_id):
+        """Delete a job"""
+        reply = QMessageBox.question(self, "Confirm Delete", 
+                                     "Are you sure you want to delete this job?",
+                                     QMessageBox.Yes | QMessageBox.No)
+        
+        if reply == QMessageBox.Yes:
+            session = SessionLocal()
+            job = session.query(Job).get(job_id)
+            
+            if job:
+                # Remove from scheduler
+                try:
+                    self.scheduler.remove_job(f"job_{job_id}")
+                except:
+                    pass
+                
+                session.delete(job)
+                session.commit()
+            
+            session.close()
+            self.refresh_job_list()
+
