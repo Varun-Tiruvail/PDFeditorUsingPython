@@ -23,7 +23,7 @@ class CustomTitleBar(QWidget):
         layout.setSpacing(0)
         
         # App Title
-        title = QLabel("🗂️ Automation Hub")
+        title = QLabel("🗂️ Custom Reporting Automation Hub")
         title.setFont(QFont("Segoe UI", 12, QFont.Bold))
         title.setStyleSheet("color: #00D9FF; letter-spacing: 1px;")
         layout.addWidget(title)
@@ -60,6 +60,13 @@ class CustomTitleBar(QWidget):
         self.btn_maximize.clicked.connect(self.toggle_maximize)
         self.btn_close.clicked.connect(parent.close)
         
+        # Theme Toggle
+        self.btn_theme = QPushButton("🌓")
+        self.btn_theme.setStyleSheet(btn_style)
+        self.btn_theme.setFixedSize(40, 35)
+        self.btn_theme.clicked.connect(parent.toggle_theme)
+        
+        layout.addWidget(self.btn_theme)
         layout.addWidget(self.btn_minimize)
         layout.addWidget(self.btn_maximize)
         layout.addWidget(self.btn_close)
@@ -90,17 +97,29 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("Automation Hub")
         self.setGeometry(100, 100, 1400, 900)
         self.setWindowFlags(Qt.FramelessWindowHint)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        
+        self.current_theme = "dark"
         
         # Central Widget
         central = QWidget()
+        central.setObjectName("centralWidget")
         self.setCentralWidget(central)
         main_layout = QVBoxLayout(central)
-        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.setContentsMargins(10, 10, 10, 10) # Margin for window shadow/rounded corners
         main_layout.setSpacing(0)
+        
+        # Main Container (for rounded corners)
+        self.container = QFrame()
+        self.container.setObjectName("mainContainer")
+        container_layout = QVBoxLayout(self.container)
+        container_layout.setContentsMargins(0, 0, 0, 0)
+        container_layout.setSpacing(0)
+        main_layout.addWidget(self.container)
         
         # Custom Title Bar
         self.title_bar = CustomTitleBar(self)
-        main_layout.addWidget(self.title_bar)
+        container_layout.addWidget(self.title_bar)
         
         # Content Area (Sidebar + Main Content)
         content_layout = QHBoxLayout()
@@ -124,7 +143,7 @@ class MainWindow(QMainWindow):
         self.content_stack.addWidget(self.scheduler_module)
         
         content_layout.addWidget(self.content_stack)
-        main_layout.addLayout(content_layout)
+        container_layout.addLayout(content_layout)
         
         # Apply Styling
         self.apply_styles()
@@ -141,7 +160,7 @@ class MainWindow(QMainWindow):
         
         # Info Label
         info = QLabel("MODULES")
-        info.setStyleSheet("color: #888; font-size: 11px; font-weight: 600; letter-spacing: 1px; padding-left: 10px;")
+        info.setObjectName("modulesLabel")
         layout.addWidget(info)
         
         # Navigation Buttons
@@ -164,7 +183,7 @@ class MainWindow(QMainWindow):
         
         # Footer
         footer = QLabel("v1.0.0")
-        footer.setStyleSheet("color: #555; font-size: 10px; padding: 10px;")
+        footer.setObjectName("footerLabel")
         footer.setAlignment(Qt.AlignCenter)
         layout.addWidget(footer)
         
@@ -182,104 +201,161 @@ class MainWindow(QMainWindow):
             btn.setProperty("active", i == index)
             btn.style().unpolish(btn)
             btn.style().polish(btn)
+            
+    def toggle_theme(self):
+        self.current_theme = "light" if self.current_theme == "dark" else "dark"
+        self.apply_styles()
     
     def apply_styles(self):
-        """Apply global stylesheet"""
-        self.setStyleSheet("""
-            QMainWindow {
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
-                    stop:0 #0A0E27, stop:1 #1A1F3A);
-            }
-            
-            #sidebar {
-                background: rgba(15, 20, 35, 0.95);
-                border-right: 1px solid rgba(255, 255, 255, 0.08);
-            }
-            
-            QPushButton#navButton {
+        """Apply global stylesheet based on theme"""
+        
+        if self.current_theme == "dark":
+            # Dark Glassmorphism Theme
+            bg_gradient = "qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #0f172a, stop:1 #1e293b)"
+            sidebar_bg = "rgba(30, 41, 59, 0.7)"
+            text_color = "#e2e8f0"
+            secondary_text = "#94a3b8"
+            accent_color = "#3b82f6"
+            glass_bg = "rgba(255, 255, 255, 0.05)"
+            border_color = "rgba(255, 255, 255, 0.1)"
+            btn_hover = "rgba(255, 255, 255, 0.1)"
+            input_bg = "rgba(15, 23, 42, 0.6)"
+        else:
+            # Light Glassmorphism Theme
+            bg_gradient = "qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #f8fafc, stop:1 #e2e8f0)"
+            sidebar_bg = "rgba(255, 255, 255, 0.7)"
+            text_color = "#1e293b"
+            secondary_text = "#64748b"
+            accent_color = "#3b82f6"
+            glass_bg = "rgba(255, 255, 255, 0.5)"
+            border_color = "rgba(0, 0, 0, 0.05)"
+            btn_hover = "rgba(0, 0, 0, 0.05)"
+            input_bg = "rgba(255, 255, 255, 0.8)"
+
+        self.setStyleSheet(f"""
+            QMainWindow {{
                 background: transparent;
-                color: #B0B0B0;
+            }}
+            
+            #mainContainer {{
+                background: {bg_gradient};
+                border-radius: 16px;
+                border: 1px solid {border_color};
+            }}
+            
+            #sidebar {{
+                background: {sidebar_bg};
+                border-right: 1px solid {border_color};
+                border-top-left-radius: 0px;
+                border-bottom-left-radius: 16px;
+            }}
+            
+            QLabel {{
+                color: {text_color};
+            }}
+            
+            #modulesLabel {{
+                color: {secondary_text};
+                font-size: 11px; 
+                font-weight: 700; 
+                letter-spacing: 1px; 
+                padding-left: 10px;
+            }}
+            
+            #footerLabel {{
+                color: {secondary_text};
+                font-size: 10px; 
+                padding: 10px;
+            }}
+            
+            QPushButton#navButton {{
+                background: transparent;
+                color: {secondary_text};
                 border: none;
                 border-radius: 10px;
                 text-align: left;
                 padding-left: 18px;
                 font-size: 14px;
                 font-weight: 500;
-            }
+            }}
             
-            QPushButton#navButton:hover {
-                background: rgba(255, 255, 255, 0.06);
-                color: white;
-            }
+            QPushButton#navButton:hover {{
+                background: {btn_hover};
+                color: {text_color};
+            }}
             
-            QPushButton#navButton[active="true"] {
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-                    stop:0 #667EEA, stop:1 #764BA2);
+            QPushButton#navButton[active="true"] {{
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #6366f1, stop:1 #8b5cf6);
                 color: white;
                 font-weight: 600;
-            }
+                box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
+            }}
             
-            QScrollArea {
-                background: rgba(255, 255, 255, 0.03);
-                border: 1px solid rgba(255, 255, 255, 0.08);
-                border-radius: 10px;
-            }
+            /* Glassmorphism Panels */
+            QScrollArea, QTableWidget, QListWidget, QTabWidget::pane {{
+                background: {glass_bg};
+                border: 1px solid {border_color};
+                border-radius: 12px;
+            }}
             
-            QTableWidget {
-                background: rgba(255, 255, 255, 0.03);
-                border: 1px solid rgba(255, 255, 255, 0.08);
-                border-radius: 8px;
-                color: white;
-                gridline-color: rgba(255, 255, 255, 0.05);
-            }
+            QTableWidget, QListWidget {{
+                color: {text_color};
+                gridline-color: {border_color};
+            }}
             
-            QTableWidget::item {
-                padding: 5px;
-            }
-            
-            QHeaderView::section {
-                background: rgba(255, 255, 255, 0.05);
-                color: white;
+            QHeaderView::section {{
+                background: {glass_bg};
+                color: {text_color};
                 padding: 8px;
                 border: none;
                 font-weight: 600;
-            }
+            }}
             
-            QLineEdit, QSpinBox, QComboBox {
-                background: rgba(255, 255, 255, 0.05);
-                border: 1px solid rgba(255, 255, 255, 0.1);
-                border-radius: 6px;
-                color: white;
+            /* Inputs */
+            QLineEdit, QSpinBox, QComboBox {{
+                background: {input_bg};
+                border: 1px solid {border_color};
+                border-radius: 8px;
+                color: {text_color};
                 padding: 8px 12px;
                 font-size: 13px;
-            }
+            }}
             
-            QLineEdit:focus, QSpinBox:focus, QComboBox:focus {
-                border: 1px solid #667EEA;
-                background: rgba(255, 255, 255, 0.08);
-            }
+            QLineEdit:focus, QSpinBox:focus, QComboBox:focus {{
+                border: 1px solid {accent_color};
+                background: {input_bg};
+            }}
             
-            QListWidget {
-                background: rgba(255, 255, 255, 0.03);
-                border: 1px solid rgba(255, 255, 255, 0.08);
-                border-radius: 8px;
+            /* Tabs */
+            QTabBar::tab {{
+                background: {glass_bg};
+                color: {secondary_text};
+                padding: 8px 16px;
+                border-top-left-radius: 8px;
+                border-top-right-radius: 8px;
+                margin-right: 4px;
+            }}
+            
+            QTabBar::tab:selected {{
+                background: {accent_color};
                 color: white;
-                padding: 5px;
-            }
+            }}
             
-            QListWidget::item {
-                padding: 10px;
-                border-radius: 6px;
-            }
-            
-            QListWidget::item:hover {
-                background: rgba(255, 255, 255, 0.05);
-            }
-            
-            QListWidget::item:selected {
-                background: rgba(102, 126, 234, 0.3);
-                color: white;
-            }
+            /* Scrollbars */
+            QScrollBar:vertical {{
+                border: none;
+                background: transparent;
+                width: 8px;
+                margin: 0px;
+            }}
+            QScrollBar::handle:vertical {{
+                background: {border_color};
+                min-height: 20px;
+                border-radius: 4px;
+            }}
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
+                height: 0px;
+            }}
         """)
 
 def main():

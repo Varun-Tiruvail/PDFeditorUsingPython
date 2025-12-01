@@ -3,6 +3,7 @@ Automation Hub - All Business Logic & Modules
 Contains: PDF Editor, OCR Trainer, Scheduler, Database, Utilities
 """
 import os
+import re
 import fitz  # PyMuPDF
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton, 
                                QLabel, QFileDialog, QScrollArea, QTableWidget,
@@ -68,17 +69,59 @@ class PDFTab(QWidget):
 
     def setup_ui(self):
         layout = QVBoxLayout(self)
+        
+        # Navigation Toolbar
+        nav_layout = QHBoxLayout()
+        nav_layout.setAlignment(Qt.AlignCenter)
+        
+        self.btn_prev = QPushButton("◀")
+        self.btn_prev.setFixedSize(40, 30)
+        self.btn_prev.clicked.connect(self.prev_page)
+        
+        self.lbl_page = QLabel("Page 0 / 0")
+        self.lbl_page.setStyleSheet("font-weight: bold; color: #ccc; padding: 0 10px;")
+        
+        self.btn_next = QPushButton("▶")
+        self.btn_next.setFixedSize(40, 30)
+        self.btn_next.clicked.connect(self.next_page)
+        
+        nav_layout.addWidget(self.btn_prev)
+        nav_layout.addWidget(self.lbl_page)
+        nav_layout.addWidget(self.btn_next)
+        
+        layout.addLayout(nav_layout)
+        
+        # Scroll Area
         self.scroll = QScrollArea()
         self.label = QLabel()
         self.label.setAlignment(Qt.AlignCenter)
         self.scroll.setWidget(self.label)
         self.scroll.setWidgetResizable(True)
         layout.addWidget(self.scroll)
+        
         self.render()
+
+    def prev_page(self):
+        if self.current_page > 0:
+            self.current_page -= 1
+            self.render()
+
+    def next_page(self):
+        if self.doc and self.current_page < len(self.doc) - 1:
+            self.current_page += 1
+            self.render()
 
     def render(self):
         if not self.doc: return
         try:
+            # Update Page Label
+            total_pages = len(self.doc)
+            self.lbl_page.setText(f"Page {self.current_page + 1} / {total_pages}")
+            
+            # Enable/Disable buttons
+            self.btn_prev.setEnabled(self.current_page > 0)
+            self.btn_next.setEnabled(self.current_page < total_pages - 1)
+            
             page = self.doc.load_page(self.current_page)
             pix = page.get_pixmap(matrix=fitz.Matrix(self.scale, self.scale))
             img = QImage(pix.samples, pix.width, pix.height, pix.stride, QImage.Format_RGB888)
@@ -98,7 +141,8 @@ class PDFEditorModule(QWidget):
         
         # Title
         title = QLabel("📄 PDF Editor")
-        title.setStyleSheet("font-size: 24px; font-weight: bold; color: white;")
+        title.setObjectName("moduleTitle")
+        title.setStyleSheet("font-size: 24px; font-weight: bold;")
         layout.addWidget(title)
         
         # Toolbar
@@ -124,11 +168,6 @@ class PDFEditorModule(QWidget):
         self.tabs = QTabWidget()
         self.tabs.setTabsClosable(True)
         self.tabs.tabCloseRequested.connect(self.close_tab)
-        self.tabs.setStyleSheet("""
-            QTabWidget::pane { border: 1px solid #444; }
-            QTabBar::tab { background: #333; color: #ccc; padding: 8px 12px; }
-            QTabBar::tab:selected { background: #555; color: white; }
-        """)
         layout.addWidget(self.tabs)
 
     def create_btn(self, text, callback):
@@ -266,21 +305,30 @@ class PDFEditorModule(QWidget):
             
             for page in doc:
                 rect = page.rect
-                bottom_rect = fitz.Rect(0, rect.height * 0.9, rect.width, rect.height)
-                blocks = page.get_text("dict", clip=bottom_rect)["blocks"]
-                for b in blocks:
-                    for l in b["lines"]:
-                        for s in l["spans"]:
-                            text = s["text"].strip()
-                            for pat in patterns:
-                                if re.match(pat, text, re.IGNORECASE):
-                                    page.add_redact_annot(fitz.Rect(s["bbox"]), fill=(1, 1, 1))
-                                    count += 1
-                                    break
+                w, h = rect.width, rect.height
+                
+                # Define regions: Bottom Center (middle 33%) and Bottom Right (right 33%)
+                # Bottom 10% height
+                regions = [
+                    fitz.Rect(w * 0.33, h * 0.9, w * 0.66, h), # Bottom Center
+                    fitz.Rect(w * 0.66, h * 0.9, w, h)         # Bottom Right
+                ]
+                
+                for region in regions:
+                    blocks = page.get_text("dict", clip=region)["blocks"]
+                    for b in blocks:
+                        for l in b["lines"]:
+                            for s in l["spans"]:
+                                text = s["text"].strip()
+                                for pat in patterns:
+                                    if re.match(pat, text, re.IGNORECASE):
+                                        page.add_redact_annot(fitz.Rect(s["bbox"]), fill=(1, 1, 1))
+                                        count += 1
+                                        break
                 page.apply_redactions()
             
             tab.render() # Refresh view
-            QMessageBox.information(self, "Success", f"Redacted {count} locations. Preview updated!")
+            QMessageBox.information(self, "Success", f"Redacted {count} locations in Bottom Center/Right.")
         except Exception as e:
             QMessageBox.critical(self, "Error", str(e))
 
@@ -292,6 +340,11 @@ class PDFEditorModule(QWidget):
         dialog.setWindowTitle("Add Page Numbers")
         layout = QVBoxLayout(dialog)
         
+        layout.addWidget(QLabel("Format:"))
+        fmt_combo = QComboBox()
+        fmt_combo.addItems(["Page n of n", "n"])
+        layout.addWidget(fmt_combo)
+        
         layout.addWidget(QLabel("Exclude Pages (e.g. 1, 3-5):"))
         exclude_input = QLineEdit()
         layout.addWidget(exclude_input)
@@ -300,6 +353,12 @@ class PDFEditorModule(QWidget):
         pos_combo = QComboBox()
         pos_combo.addItems(["Bottom Center", "Bottom Right", "Bottom Left", "Top Center", "Top Right"])
         layout.addWidget(pos_combo)
+        
+        layout.addWidget(QLabel("Font Size:"))
+        size_spin = QSpinBox()
+        size_spin.setRange(6, 72)
+        size_spin.setValue(10)
+        layout.addWidget(size_spin)
         
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.accepted.connect(dialog.accept)
@@ -320,11 +379,18 @@ class PDFEditorModule(QWidget):
                             excluded.add(int(part))
                 
                 total = len(doc)
+                fmt = fmt_combo.currentText()
+                font_size = size_spin.value()
+                
                 for i, page in enumerate(doc):
                     pg_num = i + 1
                     if pg_num in excluded: continue
                     
-                    text = f"Page {pg_num} of {total}"
+                    if fmt == "n":
+                        text = f"{pg_num}"
+                    else:
+                        text = f"Page {pg_num} of {total}"
+                        
                     rect = page.rect
                     pos_idx = pos_combo.currentIndex()
                     
@@ -334,7 +400,7 @@ class PDFEditorModule(QWidget):
                     elif pos_idx == 3: pt = fitz.Point(rect.width/2 - 30, 30)
                     else: pt = fitz.Point(rect.width - 80, 30)
                         
-                    page.insert_text(pt, text, fontsize=10, color=(0, 0, 0))
+                    page.insert_text(pt, text, fontsize=font_size, color=(0, 0, 0))
                 
                 tab.render()
                 QMessageBox.information(self, "Success", "Page numbers added! Preview updated.")
@@ -348,6 +414,10 @@ class PDFEditorModule(QWidget):
         dialog = QDialog(self)
         dialog.setWindowTitle("Add Header/Footer")
         layout = QVBoxLayout(dialog)
+        
+        # Preset Button
+        btn_draft = QPushButton("Load 'DRAFT' Preset")
+        layout.addWidget(btn_draft)
         
         layout.addWidget(QLabel("Text:"))
         text_input = QLineEdit()
@@ -363,6 +433,32 @@ class PDFEditorModule(QWidget):
         align_combo.addItems(["Center", "Left", "Right"])
         layout.addWidget(align_combo)
         
+        # Styling
+        style_layout = QHBoxLayout()
+        
+        style_layout.addWidget(QLabel("Size:"))
+        size_spin = QSpinBox()
+        size_spin.setRange(8, 72)
+        size_spin.setValue(12)
+        style_layout.addWidget(size_spin)
+        
+        style_layout.addWidget(QLabel("Color:"))
+        color_combo = QComboBox()
+        color_combo.addItems(["Black", "Red", "Blue", "Green", "Gray"])
+        style_layout.addWidget(color_combo)
+        
+        layout.addLayout(style_layout)
+        
+        # Preset Logic
+        def load_draft():
+            text_input.setText("DRAFT")
+            type_combo.setCurrentText("Header")
+            align_combo.setCurrentText("Center")
+            size_spin.setValue(26)
+            color_combo.setCurrentText("Red")
+        
+        btn_draft.clicked.connect(load_draft)
+        
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.accepted.connect(dialog.accept)
         buttons.rejected.connect(dialog.reject)
@@ -376,14 +472,31 @@ class PDFEditorModule(QWidget):
                 doc = tab.doc
                 is_header = type_combo.currentText() == "Header"
                 align = align_combo.currentText()
+                size = size_spin.value()
+                color_name = color_combo.currentText().lower()
+                
+                # Map color names to RGB tuples
+                colors = {
+                    "black": (0, 0, 0),
+                    "red": (1, 0, 0),
+                    "blue": (0, 0, 1),
+                    "green": (0, 0.5, 0),
+                    "gray": (0.5, 0.5, 0.5)
+                }
+                color = colors.get(color_name, (0, 0, 0))
                 
                 for page in doc:
                     rect = page.rect
                     y = 30 if is_header else rect.height - 20
-                    if align == "Center": x = rect.width / 2 - (len(text) * 2.5)
+                    
+                    # Calculate X based on text length (approx)
+                    text_width = len(text) * (size * 0.5) 
+                    
+                    if align == "Center": x = (rect.width - text_width) / 2
                     elif align == "Left": x = 20
-                    else: x = rect.width - 20 - (len(text) * 5)
-                    page.insert_text(fitz.Point(x, y), text, fontsize=10, color=(0, 0, 0))
+                    else: x = rect.width - 20 - text_width
+                    
+                    page.insert_text(fitz.Point(x, y), text, fontsize=size, color=color)
                 
                 tab.render()
                 QMessageBox.information(self, "Success", "Header/Footer added! Preview updated.")
@@ -415,7 +528,8 @@ class OCRTrainerModule(QWidget):
         left_panel = QVBoxLayout()
         
         title = QLabel("🔍 OCR Trainer")
-        title.setStyleSheet("font-size: 20px; font-weight: bold; color: white;")
+        title.setObjectName("moduleTitle")
+        title.setStyleSheet("font-size: 20px; font-weight: bold;")
         left_panel.addWidget(title)
         
         btn_upload = QPushButton("📤 Upload PDF")
@@ -758,7 +872,8 @@ class SchedulerModule(QWidget):
         layout.setContentsMargins(20, 20, 20, 20)
         
         title = QLabel("⏰ Scheduler")
-        title.setStyleSheet("font-size: 24px; font-weight: bold; color: white;")
+        title.setObjectName("moduleTitle")
+        title.setStyleSheet("font-size: 24px; font-weight: bold;")
         layout.addWidget(title)
         
         btn_add = QPushButton("➕ Add Job")
