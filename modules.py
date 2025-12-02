@@ -559,7 +559,7 @@ class PDFEditorModule(QWidget):
                     
                     # Fix: Use a separate function to capture closure correctly
                     def connect_cb(checkbox, input_field):
-                        checkbox.stateChanged.connect(lambda state: input_field.setEnabled(state == Qt.Checked))
+                        checkbox.stateChanged.connect(lambda state: input_field.setEnabled(state == 2))
                     
                     connect_cb(cb, label_input)
                     
@@ -1512,11 +1512,11 @@ class SchedulerModule(QWidget):
         interval_layout.addWidget(QLabel("Every:"))
         interval_spin = QSpinBox()
         interval_spin.setRange(1, 86400)
-        interval_spin.setValue(60)
+        interval_spin.setValue(1)
         interval_layout.addWidget(interval_spin)
         interval_unit = QComboBox()
         interval_unit.addItems(["Seconds", "Minutes", "Hours"])
-        interval_unit.setCurrentText("Minutes")
+        interval_unit.setCurrentText("Hours")
         interval_layout.addWidget(interval_unit)
         recurring_layout.addWidget(interval_widget)
         
@@ -1551,7 +1551,19 @@ class SchedulerModule(QWidget):
         day_spin.setRange(1, 31)
         day_spin.setValue(1)
         monthly_layout.addWidget(day_spin)
+        monthly_layout.addWidget(day_spin)
+        
+        # Business Day Checkbox (Placeholder for now)
+        business_day_cb = QCheckBox("Business Day Only (Mon-Fri)")
+        monthly_layout.addWidget(business_day_cb)
+        
         recurring_layout.addWidget(monthly_widget)
+        
+        # Summary Label
+        summary_label = QLabel("Summary: Runs once at specified time.")
+        summary_label.setStyleSheet("color: #666; font-style: italic; margin-top: 10px;")
+        summary_label.setWordWrap(True)
+        layout.addWidget(summary_label)
         
         # Show/hide based on recurrence type
         def update_recurrence_widgets():
@@ -1560,8 +1572,40 @@ class SchedulerModule(QWidget):
             time_widget.setVisible(rec_type in ["Daily", "Weekly", "Monthly"])
             weekly_widget.setVisible(rec_type == "Weekly")
             monthly_widget.setVisible(rec_type == "Monthly")
-        
+            update_summary()
+            
+        def update_summary():
+            if radio_onetime.isChecked():
+                summary_label.setText(f"Summary: Runs once on {datetime_picker.dateTime().toString('yyyy-MM-dd HH:mm')}")
+                return
+                
+            rec_type = recurrence_combo.currentText()
+            if rec_type == "Interval":
+                summary_label.setText(f"Summary: Runs every {interval_spin.value()} {interval_unit.currentText().lower()}")
+            elif rec_type == "Daily":
+                summary_label.setText(f"Summary: Runs every day at {time_picker.text()}")
+            elif rec_type == "Weekly":
+                days = [cb.text() for cb in day_checks if cb.isChecked()]
+                day_str = ", ".join(days) if days else "selected days"
+                summary_label.setText(f"Summary: Runs every {day_str} at {time_picker.text()}")
+            elif rec_type == "Monthly":
+                day = day_spin.value()
+                suffix = "th" if 11 <= day <= 13 else {1: "st", 2: "nd", 3: "rd"}.get(day % 10, "th")
+                biz_str = " (Business Day)" if business_day_cb.isChecked() else ""
+                summary_label.setText(f"Summary: Runs on the {day}{suffix}{biz_str} of every month at {time_picker.text()}")
+
+        # Connect signals to update summary
+        radio_onetime.toggled.connect(update_summary)
+        datetime_picker.dateTimeChanged.connect(update_summary)
         recurrence_combo.currentTextChanged.connect(update_recurrence_widgets)
+        interval_spin.valueChanged.connect(update_summary)
+        interval_unit.currentTextChanged.connect(update_summary)
+        time_picker.textChanged.connect(update_summary)
+        day_spin.valueChanged.connect(update_summary)
+        business_day_cb.stateChanged.connect(update_summary)
+        for cb in day_checks:
+            cb.stateChanged.connect(update_summary)
+        
         update_recurrence_widgets()
         
         layout.addWidget(recurring_widget)
