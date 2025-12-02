@@ -90,9 +90,12 @@ class PDFTab(QWidget):
     def setup_ui(self):
         layout = QVBoxLayout(self)
         
+        # Toolbar Container
+        toolbar_layout = QHBoxLayout()
+        
         # Navigation Toolbar
         nav_layout = QHBoxLayout()
-        nav_layout.setAlignment(Qt.AlignCenter)
+        nav_layout.setAlignment(Qt.AlignLeft)
         
         self.btn_prev = QPushButton("◀")
         self.btn_prev.setFixedSize(40, 30)
@@ -109,7 +112,35 @@ class PDFTab(QWidget):
         nav_layout.addWidget(self.lbl_page)
         nav_layout.addWidget(self.btn_next)
         
-        layout.addLayout(nav_layout)
+        # Zoom Toolbar
+        zoom_layout = QHBoxLayout()
+        zoom_layout.setAlignment(Qt.AlignRight)
+        
+        self.btn_zoom_out = QPushButton("−")
+        self.btn_zoom_out.setFixedSize(40, 30)
+        self.btn_zoom_out.clicked.connect(self.zoom_out)
+        
+        self.lbl_zoom = QLabel("150%")
+        self.lbl_zoom.setStyleSheet("font-weight: bold; color: #ccc; padding: 0 10px;")
+        
+        self.btn_zoom_in = QPushButton("+")
+        self.btn_zoom_in.setFixedSize(40, 30)
+        self.btn_zoom_in.clicked.connect(self.zoom_in)
+        
+        self.btn_fit = QPushButton("Fit")
+        self.btn_fit.setFixedSize(50, 30)
+        self.btn_fit.clicked.connect(self.fit_to_screen)
+        
+        zoom_layout.addWidget(self.btn_zoom_out)
+        zoom_layout.addWidget(self.lbl_zoom)
+        zoom_layout.addWidget(self.btn_zoom_in)
+        zoom_layout.addWidget(self.btn_fit)
+        
+        # Combine toolbars
+        toolbar_layout.addLayout(nav_layout)
+        toolbar_layout.addStretch()
+        toolbar_layout.addLayout(zoom_layout)
+        layout.addLayout(toolbar_layout)
         
         # Scroll Area
         self.scroll = QScrollArea()
@@ -120,6 +151,32 @@ class PDFTab(QWidget):
         layout.addWidget(self.scroll)
         
         self.render()
+    
+    def zoom_in(self):
+        self.scale *= 1.2
+        self.update_zoom_label()
+        self.render()
+    
+    def zoom_out(self):
+        self.scale /= 1.2
+        self.update_zoom_label()
+        self.render()
+    
+    def fit_to_screen(self):
+        if not self.doc: return
+        try:
+            page = self.doc.load_page(self.current_page)
+            page_width = page.rect.width
+            scroll_width = self.scroll.width() - 40  # Account for margins
+            self.scale = scroll_width / page_width
+            self.update_zoom_label()
+            self.render()
+        except Exception as e:
+            print(f"Fit error: {e}")
+    
+    def update_zoom_label(self):
+        zoom_pct = int(self.scale * 100)
+        self.lbl_zoom.setText(f"{zoom_pct}%")
 
     def prev_page(self):
         if self.current_page > 0:
@@ -257,60 +314,438 @@ class PDFEditorModule(QWidget):
                 QMessageBox.critical(self, "Error", str(e))
 
     def merge_pdfs(self):
-        # Custom dialog for reordering
+        """Show merge options: Simple or Header-Based"""
+        choice_dialog = QDialog(self)
+        choice_dialog.setWindowTitle("Choose Merge Type")
+        choice_dialog.resize(400, 200)
+        layout = QVBoxLayout(choice_dialog)
+        
+        layout.addWidget(QLabel("<h3>How would you like to merge PDFs?</h3>"))
+        
+        btn_simple = QPushButton("📑 Simple Merge with Page Rearranging")
+        btn_simple.clicked.connect(lambda: (choice_dialog.accept(), self.merge_simple()))
+        layout.addWidget(btn_simple)
+        
+        btn_headers = QPushButton("📌 Header-Based Merge (Insert PDFs after headers)")
+        btn_headers.clicked.connect(lambda: (choice_dialog.accept(), self.merge_with_headers()))
+        layout.addWidget(btn_headers)
+        
+        btn_cancel = QPushButton("Cancel")
+        btn_cancel.clicked.connect(choice_dialog.reject)
+        layout.addWidget(btn_cancel)
+        
+        choice_dialog.exec()
+    
+    def merge_simple(self):
+        """Simple merge with page-level rearranging"""
+        from PySide6.QtWidgets import QListWidgetItem
+        from PySide6.QtCore import QSize
+        
         dialog = QDialog(self)
-        dialog.setWindowTitle("Merge PDFs - Drag to Reorder")
-        dialog.resize(500, 400)
+        dialog.setWindowTitle("Simple Merge - Arrange Pages")
+        dialog.resize(800, 600)
         layout = QVBoxLayout(dialog)
         
-        list_widget = QListWidget()
-        list_widget.setDragDropMode(QListWidget.InternalMove)
-        layout.addWidget(list_widget)
+        # Layout: Left side for PDF list, Right side for Thumbnails
+        content_layout = QHBoxLayout()
         
-        btn_add = QPushButton("Add PDFs")
-        def add_files():
+        # LEFT PANEL: PDF List
+        left_panel = QWidget()
+        left_layout = QVBoxLayout(left_panel)
+        left_layout.addWidget(QLabel("<b>1. Add PDFs</b>"))
+        
+        pdf_listwidget = QListWidget()
+        pdf_listwidget.setDragDropMode(QListWidget.InternalMove)
+        left_layout.addWidget(pdf_listwidget)
+        
+        btn_add = QPushButton("+ Add PDFs")
+        def add_pdfs():
             files, _ = QFileDialog.getOpenFileNames(self, "Select PDFs", "", "PDF Files (*.pdf)")
             for f in files:
-                list_widget.addItem(f)
-        btn_add.clicked.connect(add_files)
-        layout.addWidget(btn_add)
+                pdf_listwidget.addItem(f)
+        btn_add.clicked.connect(add_pdfs)
+        left_layout.addWidget(btn_add)
+        
+        btn_load_pages = QPushButton("Load Pages →")
+        left_layout.addWidget(btn_load_pages)
+        left_layout.addStretch()
+        
+        content_layout.addWidget(left_panel, stretch=1)
+        
+        # RIGHT PANEL: Page Thumbnails
+        right_panel = QWidget()
+        right_layout = QVBoxLayout(right_panel)
+        right_layout.addWidget(QLabel("<b>2. Arrange Pages</b>"))
+        
+        page_listwidget = QListWidget()
+        page_listwidget.setDragDropMode(QListWidget.InternalMove)
+        page_listwidget.setViewMode(QListWidget.ListMode)
+        page_listwidget.setIconSize(QSize(100, 140))
+        page_listwidget.setSpacing(5)
+        right_layout.addWidget(page_listwidget)
+        
+        # Move Buttons
+        btn_layout = QHBoxLayout()
+        btn_up = QPushButton("▲ Move Up")
+        btn_down = QPushButton("▼ Move Down")
+        
+        def move_item(direction):
+            row = page_listwidget.currentRow()
+            if row < 0: return
+            
+            new_row = row + direction
+            if 0 <= new_row < page_listwidget.count():
+                item = page_listwidget.takeItem(row)
+                page_listwidget.insertItem(new_row, item)
+                page_listwidget.setCurrentRow(new_row)
+        
+        btn_up.clicked.connect(lambda: move_item(-1))
+        btn_down.clicked.connect(lambda: move_item(1))
+        
+        btn_layout.addWidget(btn_up)
+        btn_layout.addWidget(btn_down)
+        right_layout.addWidget(page_listwidget)
+        right_layout.addLayout(btn_layout)
+        
+        content_layout.addWidget(right_panel, stretch=2)
+        layout.addLayout(content_layout)
+        
+        # Load pages logic
+        def load_pages():
+            page_listwidget.clear()
+            for i in range(pdf_listwidget.count()):
+                pdf_path = pdf_listwidget.item(i).text()
+                try:
+                    doc = fitz.open(pdf_path)
+                    pdf_name = os.path.basename(pdf_path)
+                    for page_num in range(len(doc)):
+                        page = doc.load_page(page_num)
+                        pix = page.get_pixmap(matrix=fitz.Matrix(0.3, 0.3))
+                        img = QImage(pix.samples, pix.width, pix.height, pix.stride, QImage.Format_RGB888)
+                        item = QListWidgetItem(QPixmap.fromImage(img), f"{pdf_name}\nP{page_num + 1}")
+                        item.setData(Qt.UserRole, (i, page_num))
+                        page_listwidget.addItem(item)
+                    doc.close()
+                except Exception as e:
+                    print(f"Error: {e}")
+        btn_load_pages.clicked.connect(load_pages)
         
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.accepted.connect(dialog.accept)
         buttons.rejected.connect(dialog.reject)
         layout.addWidget(buttons)
         
-        if dialog.exec() == QDialog.Accepted and list_widget.count() > 0:
+        if dialog.exec() == QDialog.Accepted and page_listwidget.count() > 0:
             try:
                 merged = fitz.open()
-                for i in range(list_widget.count()):
-                    f = list_widget.item(i).text()
-                    merged.insert_pdf(fitz.open(f))
+                pdf_docs = [fitz.open(pdf_listwidget.item(i).text()) for i in range(pdf_listwidget.count())]
                 
-                # Open merged in new tab (in-memory)
+                for i in range(page_listwidget.count()):
+                    item = page_listwidget.item(i)
+                    pdf_idx, page_num = item.data(Qt.UserRole)
+                    merged.insert_pdf(pdf_docs[pdf_idx], from_page=page_num, to_page=page_num)
+                
+                for doc in pdf_docs:
+                    doc.close()
+                
                 tab = PDFTab(merged, "Merged.pdf")
                 self.tabs.addTab(tab, "Merged.pdf")
                 self.tabs.setCurrentWidget(tab)
-                QMessageBox.information(self, "Success", "Merged PDF opened in new tab! Click Save to keep it.")
+                QMessageBox.information(self, "Success", f"Merged {page_listwidget.count()} pages!")
+            except Exception as e:
+                QMessageBox.critical(self, "Error", str(e))
+    
+    def merge_with_headers(self):
+        """Header-based merge: Insert PDFs after specific header pages"""
+        from PySide6.QtWidgets import QListWidgetItem, QStackedWidget
+        
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Header-Based Merge")
+        dialog.resize(700, 600)
+        layout = QVBoxLayout(dialog)
+        
+        stack = QStackedWidget()
+        layout.addWidget(stack)
+        
+        # Nav buttons
+        nav_layout = QHBoxLayout()
+        btn_back = QPushButton("◀ Back")
+        btn_next = QPushButton("Next ▶")
+        btn_merge = QPushButton("✓ Merge")
+        btn_merge.setVisible(False)
+        nav_layout.addWidget(btn_back)
+        nav_layout.addStretch()
+        nav_layout.addWidget(btn_next)
+        nav_layout.addWidget(btn_merge)
+        layout.addLayout(nav_layout)
+        
+        base_pdf = None
+        headers = []  # [(page_num, label), ...]
+        insertions = {}  # {page_num: [pdf_paths]}
+        
+        # STEP 1: Select base PDF
+        step1 = QWidget()
+        step1_layout = QVBoxLayout(step1)
+        step1_layout.addWidget(QLabel("<h2>Step 1: Select Base PDF</h2>"))
+        step1_layout.addWidget(QLabel("This PDF contains the header pages:"))
+        
+        base_label = QLabel("No PDF selected")
+        step1_layout.addWidget(base_label)
+        
+        def select_base():
+            nonlocal base_pdf
+            path, _ = QFileDialog.getOpenFileName(dialog, "Select Base PDF", "", "PDF Files (*.pdf)")
+            if path:
+                base_pdf = path
+                base_label.setText(f"Selected: {os.path.basename(path)}")
+        
+        btn_select_base = QPushButton("Browse...")
+        btn_select_base.clicked.connect(select_base)
+        step1_layout.addWidget(btn_select_base)
+        stack.addWidget(step1)
+        
+        # STEP 2: Mark headers
+        step2 = QWidget()
+        step2_layout = QVBoxLayout(step2)
+        step2_layout.addWidget(QLabel("<h2>Step 2: Mark Header Pages</h2>"))
+        
+        header_scroll = QScrollArea()
+        header_container = QWidget()
+        header_container_layout = QVBoxLayout(header_container)
+        header_scroll.setWidget(header_container)
+        header_scroll.setWidgetResizable(True)
+        step2_layout.addWidget(header_scroll)
+        stack.addWidget(step2)
+        
+        # STEP 3: Insert PDFs after headers
+        step3 = QWidget()
+        step3_layout = QVBoxLayout(step3)
+        step3_layout.addWidget(QLabel("<h2>Step 3: Insert PDFs After Headers</h2>"))
+        
+        insert_scroll = QScrollArea()
+        insert_container = QWidget()
+        insert_container_layout = QVBoxLayout(insert_container)
+        insert_scroll.setWidget(insert_container)
+        insert_scroll.setWidgetResizable(True)
+        step3_layout.addWidget(insert_scroll)
+        stack.addWidget(step3)
+        
+        # Navigation
+        def go_step1():
+            stack.setCurrentIndex(0)
+            btn_back.setVisible(False)
+            btn_next.setVisible(True)
+            btn_merge.setVisible(False)
+        
+        def go_step2():
+            if not base_pdf:
+                QMessageBox.warning(dialog, "Warning", "Please select a base PDF")
+                return
+            
+            # Load base PDF and show pages
+            for i in reversed(range(header_container_layout.count())):
+                header_container_layout.itemAt(i).widget().deleteLater()
+            
+            try:
+                doc = fitz.open(base_pdf)
+                from PySide6.QtWidgets import QCheckBox
+                for page_num in range(len(doc)):
+                    row = QHBoxLayout()
+                    cb = QCheckBox(f"Page {page_num + 1}")
+                    cb.setProperty("page_num", page_num)
+                    label_input = QLineEdit()
+                    label_input.setPlaceholderText("Header label (e.g., 'Section 1')")
+                    label_input.setEnabled(False)
+                    
+                    # Fix: Use a separate function to capture closure correctly
+                    def connect_cb(checkbox, input_field):
+                        checkbox.stateChanged.connect(lambda state: input_field.setEnabled(state == Qt.Checked))
+                    
+                    connect_cb(cb, label_input)
+                    
+                    row.addWidget(cb)
+                    row.addWidget(label_input)
+                    
+                    widget = QWidget()
+                    widget.setLayout(row)
+                    widget.setProperty("checkbox", cb)
+                    widget.setProperty("label_input", label_input)
+                    header_container_layout.addWidget(widget)
+                
+                doc.close()
+            except Exception as e:
+                QMessageBox.critical(dialog, "Error", str(e))
+                return
+            
+            stack.setCurrentIndex(1)
+            btn_back.setVisible(True)
+            btn_next.setVisible(True)
+            btn_merge.setVisible(False)
+        
+        def go_step3():
+            # Collect headers
+            nonlocal headers
+            headers = []
+            
+            for i in range(header_container_layout.count()):
+                widget = header_container_layout.itemAt(i).widget()
+                cb = widget.property("checkbox")
+                label_inp = widget.property("label_input")
+                
+                if cb and cb.isChecked():
+                    page_num = cb.property("page_num")
+                    label = label_inp.text() if label_inp and label_inp.text() else f"Header {len(headers) + 1}"
+                    headers.append((page_num, label))
+            
+            if not headers:
+                QMessageBox.warning(dialog, "Warning", "Please mark at least one header page")
+                return
+            
+            headers.sort()  # Sort by page number
+            
+            # Build insertion UI
+            for i in reversed(range(insert_container_layout.count())):
+                insert_container_layout.itemAt(i).widget().deleteLater()
+            
+            from PySide6.QtWidgets import QFrame
+            for page_num, label in headers:
+                group = QFrame()
+                group.setFrameStyle(QFrame.Box)
+                group_layout = QVBoxLayout(group)
+                group_layout.addWidget(QLabel(f"<b>📌 After '{label}' (Page {page_num + 1})</b>"))
+                
+                list_widget = QListWidget()
+                list_widget.setProperty("page_num", page_num)
+                
+                btn_add_pdfs = QPushButton("+ Add PDFs")
+                def add_pdfs_for_header(pg=page_num, lst=list_widget):
+                    files, _ = QFileDialog.getOpenFileNames(dialog, "Select PDFs", "", "PDF Files (*.pdf)")
+                    for f in files:
+                        lst.addItem(f)
+                
+                btn_add_pdfs.clicked.connect(add_pdfs_for_header)
+                
+                group_layout.addWidget(list_widget)
+                group_layout.addWidget(btn_add_pdfs)
+                insert_container_layout.addWidget(group)
+            
+            stack.setCurrentIndex(2)
+            btn_back.setVisible(True)
+            btn_next.setVisible(False)
+            btn_merge.setVisible(True)
+        
+        def do_merge():
+            # Collect insertion data
+            nonlocal insertions
+            insertions = {}
+            
+            for i in range(insert_container_layout.count()):
+                group_widget = insert_container_layout.itemAt(i).widget()
+                if not group_widget: continue
+                
+                # Find the list widget
+                for j in range(group_widget.layout().count()):
+                    item = group_widget.layout().itemAt(j)
+                    if not item: continue
+                    widget = item.widget()
+                    if isinstance(widget, QListWidget):
+                        page_num = widget.property("page_num")
+                        pdfs = [widget.item(k).text() for k in range(widget.count())]
+                        if pdfs:
+                            insertions[page_num] = pdfs
+            
+            dialog.accept()
+        
+        btn_back.clicked.connect(lambda: go_step1() if stack.currentIndex() == 1 else go_step2())
+        btn_next.clicked.connect(lambda: go_step2() if stack.currentIndex() == 0 else go_step3())
+        btn_merge.clicked.connect(do_merge)
+        
+        go_step1()
+        
+        if dialog.exec() == QDialog.Accepted:
+            try:
+                # Build final merged PDF
+                base_doc = fitz.open(base_pdf)
+                merged = fitz.open()
+                
+                for page_num in range(len(base_doc)):
+                    # Insert base page
+                    merged.insert_pdf(base_doc, from_page=page_num, to_page=page_num)
+                    
+                    # If this is a header, insert PDFs after it
+                    if page_num in insertions:
+                        for pdf_path in insertions[page_num]:
+                            insert_doc = fitz.open(pdf_path)
+                            merged.insert_pdf(insert_doc)
+                            insert_doc.close()
+                
+                base_doc.close()
+                
+                tab = PDFTab(merged, "Merged_Headers.pdf")
+                self.tabs.addTab(tab, "Merged_Headers.pdf")
+                self.tabs.setCurrentWidget(tab)
+                QMessageBox.information(self, "Success", "Header-based merge complete!")
             except Exception as e:
                 QMessageBox.critical(self, "Error", str(e))
 
     def split_pdf(self):
+        """Dynamic PDF split with user-specified page ranges"""
         tab = self.current_tab()
         if not tab: return
         
-        # For simplicity, just split first 3 pages as a demo, or ask user?
-        # Let's just do a simple split 1-3 for now as per previous logic, but open in new tab
-        try:
-            new_doc = fitz.open()
-            new_doc.insert_pdf(tab.doc, from_page=0, to_page=min(2, len(tab.doc)-1))
+        total_pages = len(tab.doc)
+        
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Split PDF")
+        layout = QVBoxLayout(dialog)
+        
+        layout.addWidget(QLabel(f"<h3>Split PDF ({total_pages} pages)</h3>"))
+        layout.addWidget(QLabel("Enter page ranges (e.g., '1-3, 5, 7-10'):"))
+        
+        range_input = QLineEdit()
+        range_input.setPlaceholderText("1-3, 5-7")
+        layout.addWidget(range_input)
+        
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        
+        if dialog.exec() == QDialog.Accepted:
+            range_str = range_input.text().strip()
+            if not range_str:
+                QMessageBox.warning(self, "Warning", "Please enter page ranges")
+                return
             
-            new_tab = PDFTab(new_doc, "Split.pdf")
-            self.tabs.addTab(new_tab, "Split.pdf")
-            self.tabs.setCurrentWidget(new_tab)
-            QMessageBox.information(self, "Success", "Split PDF (Pages 1-3) opened in new tab!")
-        except Exception as e:
-            QMessageBox.critical(self, "Error", str(e))
+            try:
+                # Parse ranges
+                pages = set()
+                for part in range_str.split(','):
+                    part = part.strip()
+                    if '-' in part:
+                        start, end = map(int, part.split('-'))
+                        pages.update(range(start - 1, end))  # 0-indexed
+                    else:
+                        pages.add(int(part) - 1)
+                
+                # Validate
+                pages = sorted([p for p in pages if 0 <= p < total_pages])
+                
+                if not pages:
+                    QMessageBox.warning(self, "Warning", "No valid pages selected")
+                    return
+                
+                # Create split PDF
+                new_doc = fitz.open()
+                for page_num in pages:
+                    new_doc.insert_pdf(tab.doc, from_page=page_num, to_page=page_num)
+                
+                new_tab = PDFTab(new_doc, "Split.pdf")
+                self.tabs.addTab(new_tab, "Split.pdf")
+                self.tabs.setCurrentWidget(new_tab)
+                QMessageBox.information(self, "Success", f"Split {len(pages)} pages into new tab!")
+            except Exception as e:
+                QMessageBox.critical(self, "Error", str(e))
 
     def redact_page_numbers(self):
         tab = self.current_tab()
@@ -1291,4 +1726,147 @@ class SchedulerModule(QWidget):
             
             session.close()
             self.refresh_job_list()
+
+# ============================================================================
+# MAIL DRAFTER MODULE
+# ============================================================================
+
+class MailDrafterModule(QWidget):
+    def __init__(self, pdf_editor_module):
+        super().__init__()
+        self.pdf_editor = pdf_editor_module
+        self.setup_ui()
+    
+    def setup_ui(self):
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(20, 20, 20, 20)
+        
+        # Left Panel: Form
+        form_panel = QWidget()
+        form_layout = QVBoxLayout(form_panel)
+        
+        title = QLabel("📧 Mail Drafter")
+        title.setObjectName("moduleTitle")
+        title.setStyleSheet("font-size: 24px; font-weight: bold;")
+        form_layout.addWidget(title)
+        
+        form_layout.addWidget(QLabel("From (Send on Behalf):"))
+        self.from_input = QLineEdit()
+        self.from_input.setPlaceholderText("Optional: email@address.com")
+        form_layout.addWidget(self.from_input)
+        
+        form_layout.addWidget(QLabel("To:"))
+        self.to_input = QLineEdit()
+        form_layout.addWidget(self.to_input)
+        
+        form_layout.addWidget(QLabel("Subject:"))
+        self.subject_input = QLineEdit()
+        form_layout.addWidget(self.subject_input)
+        
+        form_layout.addWidget(QLabel("Body:"))
+        self.body_input = QTextEdit()
+        form_layout.addWidget(self.body_input)
+        
+        btn_draft = QPushButton("📝 Generate Draft & Preview")
+        btn_draft.setStyleSheet("background-color: #3b82f6; color: white; padding: 10px; font-weight: bold;")
+        btn_draft.clicked.connect(self.generate_draft)
+        form_layout.addWidget(btn_draft)
+        
+        layout.addWidget(form_panel, stretch=2)
+        
+        # Right Panel: Attachments
+        attach_panel = QWidget()
+        attach_layout = QVBoxLayout(attach_panel)
+        attach_layout.addWidget(QLabel("<h3>Select Attachments</h3>"))
+        attach_layout.addWidget(QLabel("Check open PDFs to attach:"))
+        
+        self.attach_list = QListWidget()
+        attach_layout.addWidget(self.attach_list)
+        
+        btn_refresh = QPushButton("🔄 Refresh List")
+        btn_refresh.clicked.connect(self.refresh_attachments)
+        attach_layout.addWidget(btn_refresh)
+        
+        layout.addWidget(attach_panel, stretch=1)
+        
+        self.refresh_attachments()
+    
+    def refresh_attachments(self):
+        self.attach_list.clear()
+        from PySide6.QtWidgets import QListWidgetItem # Import locally to avoid NameError
+        tabs = self.pdf_editor.tabs
+        for i in range(tabs.count()):
+            tab_name = tabs.tabText(i)
+            item = QListWidgetItem(tab_name)
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            item.setCheckState(Qt.Unchecked)
+            item.setData(Qt.UserRole, i) # Store tab index
+            self.attach_list.addItem(item)
+    
+    def generate_draft(self):
+        try:
+            import win32com.client
+            import datetime
+            
+            subject = self.subject_input.text().strip()
+            if not subject:
+                QMessageBox.warning(self, "Warning", "Subject is required")
+                return
+            
+            # 1. Create Folder Structure
+            today = datetime.date.today().strftime("%Y-%m-%d")
+            safe_subject = "".join([c for c in subject if c.isalnum() or c in (' ', '-', '_')]).strip()
+            folder_path = os.path.join(os.getcwd(), "MailDrafts", today, safe_subject)
+            os.makedirs(folder_path, exist_ok=True)
+            
+            # 2. Save Attachments
+            attachments = []
+            tabs = self.pdf_editor.tabs
+            for i in range(self.attach_list.count()):
+                item = self.attach_list.item(i)
+                if item.checkState() == Qt.Checked:
+                    tab_idx = item.data(Qt.UserRole)
+                    tab = tabs.widget(tab_idx)
+                    if tab and tab.doc:
+                        filename = tabs.tabText(tab_idx)
+                        if not filename.lower().endswith(".pdf"):
+                            filename += ".pdf"
+                        save_path = os.path.join(folder_path, filename)
+                        tab.doc.save(save_path)
+                        attachments.append(save_path)
+            
+            # 3. Create Outlook Item
+            outlook = win32com.client.Dispatch("Outlook.Application")
+            mail = outlook.CreateItem(0) # 0 = olMailItem
+            
+            mail.Display() # Required to load signature
+            signature = mail.HTMLBody
+            
+            mail.To = self.to_input.text()
+            mail.Subject = subject
+            
+            if self.from_input.text().strip():
+                mail.SentOnBehalfOfName = self.from_input.text().strip()
+            
+            # Preserve signature by appending to body
+            user_body = self.body_input.toPlainText().replace("\n", "<br>")
+            mail.HTMLBody = f"<p>{user_body}</p><br>" + signature
+            
+            # Add Attachments
+            for path in attachments:
+                mail.Attachments.Add(path)
+            
+            # 4. Save Draft to Folder
+            draft_path = os.path.join(folder_path, "Draft.msg")
+            mail.SaveAs(draft_path)
+            
+            # 5. Save to Outlook Drafts
+            mail.Save()
+            
+            QMessageBox.information(self, "Success", f"Draft generated!\nSaved to: {folder_path}")
+            
+        except ImportError:
+            QMessageBox.critical(self, "Error", "pywin32 not installed. Please run: pip install pywin32")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to create draft: {e}")
 

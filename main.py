@@ -8,7 +8,7 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
 from PySide6.QtCore import Qt, QPoint
 from PySide6.QtGui import QFont
 
-from modules import PDFEditorModule, OCRTrainerModule, SchedulerModule
+from modules import PDFEditorModule, OCRTrainerModule, SchedulerModule, MailDrafterModule
 
 class CustomTitleBar(QWidget):
     """Custom draggable title bar with window controls"""
@@ -137,10 +137,12 @@ class MainWindow(QMainWindow):
         self.pdf_module = PDFEditorModule()
         self.ocr_module = OCRTrainerModule()
         self.scheduler_module = SchedulerModule()
+        self.mail_module = MailDrafterModule(self.pdf_module)
         
         self.content_stack.addWidget(self.pdf_module)
         self.content_stack.addWidget(self.ocr_module)
         self.content_stack.addWidget(self.scheduler_module)
+        self.content_stack.addWidget(self.mail_module)
         
         content_layout.addWidget(self.content_stack)
         container_layout.addLayout(content_layout)
@@ -169,6 +171,7 @@ class MainWindow(QMainWindow):
             ("📄 PDF Editor", 0),
             ("🔍 OCR Trainer", 1),
             ("⏰ Scheduler", 2),
+            ("📧 Mail Drafter", 3), # Added Mail Drafter module
         ]
         
         for text, index in modules:
@@ -288,7 +291,6 @@ class MainWindow(QMainWindow):
                 background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #6366f1, stop:1 #8b5cf6);
                 color: white;
                 font-weight: 600;
-                box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
             }}
             
             /* Glassmorphism Panels */
