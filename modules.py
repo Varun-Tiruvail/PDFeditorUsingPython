@@ -10,7 +10,7 @@ from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
                                QTableWidgetItem, QLineEdit, QSpinBox, QComboBox,
                                QTextEdit, QListWidget, QDialog, QDialogButtonBox,
                                QMessageBox, QGraphicsScene, QGraphicsView,
-                               QGraphicsRectItem, QTabWidget)
+                               QGraphicsRectItem, QTabWidget, QMainWindow, QInputDialog)
 from PySide6.QtCore import Qt, QPointF, QRectF, Signal, QThread
 from PySide6.QtGui import QPixmap, QImage, QPen, QColor, QBrush
 from sqlalchemy import create_engine, Column, Integer, String, Float, ForeignKey, Boolean, DateTime
@@ -24,6 +24,52 @@ import subprocess
 import uuid
 import pandas as pd
 import datetime
+import win32com.client
+import pythoncom
+
+# ============================================================================
+# OFFICE CONVERTER
+# ============================================================================
+
+class OfficeConverter:
+    @staticmethod
+    def convert_to_pdf(input_path):
+        """Convert PPT/Excel/Word to PDF using win32com"""
+        input_path = os.path.abspath(input_path)
+        base, ext = os.path.splitext(input_path)
+        output_path = base + "_converted.pdf"
+        
+        try:
+            pythoncom.CoInitialize()
+            ext = ext.lower()
+            
+            if ext in ['.pptx', '.ppt']:
+                powerpoint = win32com.client.Dispatch("Powerpoint.Application")
+                presentation = powerpoint.Presentations.Open(input_path, WithWindow=False)
+                presentation.SaveAs(output_path, 32) # 32 = ppSaveAsPDF
+                presentation.Close()
+                # powerpoint.Quit() # Keep open for performance?
+                
+            elif ext in ['.xlsx', '.xls']:
+                excel = win32com.client.Dispatch("Excel.Application")
+                excel.Visible = False
+                wb = excel.Workbooks.Open(input_path)
+                wb.ExportAsFixedFormat(0, output_path) # 0 = xlTypePDF
+                wb.Close(False)
+                # excel.Quit()
+                
+            elif ext in ['.docx', '.doc']:
+                word = win32com.client.Dispatch("Word.Application")
+                word.Visible = False
+                doc = word.Documents.Open(input_path)
+                doc.SaveAs(output_path, 17) # 17 = wdFormatPDF
+                doc.Close()
+                # word.Quit()
+                
+            return output_path
+        except Exception as e:
+            print(f"Conversion failed: {e}")
+            return None
 
 # ============================================================================
 # DATABASE SETUP
@@ -79,12 +125,15 @@ Base.metadata.create_all(engine)
 # ============================================================================
 
 class PDFTab(QWidget):
-    def __init__(self, doc, path=None):
+    def __init__(self, doc, path=None, is_temp=False, temp_path=None):
         super().__init__()
         self.doc = doc
         self.path = path
         self.current_page = 0
         self.scale = 1.5
+        self.is_temp = is_temp
+        self.temp_path = temp_path
+        self.parent_dock = None  # Will be set by PDFEditorModule
         self.setup_ui()
 
     def setup_ui(self):
@@ -93,7 +142,7 @@ class PDFTab(QWidget):
         # Toolbar Container
         toolbar_layout = QHBoxLayout()
         
-        # Navigation Toolbar
+        # Navigation Toolbar (Left)
         nav_layout = QHBoxLayout()
         nav_layout.setAlignment(Qt.AlignLeft)
         
@@ -112,7 +161,12 @@ class PDFTab(QWidget):
         nav_layout.addWidget(self.lbl_page)
         nav_layout.addWidget(self.btn_next)
         
-        # Zoom Toolbar
+        # File Name (Center)
+        self.lbl_filename = QLabel(os.path.basename(self.path) if self.path else "Untitled")
+        self.lbl_filename.setStyleSheet("font-weight: bold; color: #fff; padding: 0 20px; font-size: 14px;")
+        self.lbl_filename.setAlignment(Qt.AlignCenter)
+        
+        #  Zoom Toolbar (Right)
         zoom_layout = QHBoxLayout()
         zoom_layout.setAlignment(Qt.AlignRight)
         
@@ -127,18 +181,39 @@ class PDFTab(QWidget):
         self.btn_zoom_in.setFixedSize(40, 30)
         self.btn_zoom_in.clicked.connect(self.zoom_in)
         
+        self.btn_fit_width = QPushButton("Fit W")
+        self.btn_fit_width.setFixedSize(55, 30)
+        self.btn_fit_width.clicked.connect(self.fit_to_width)
+        
+        self.btn_fit_height = QPushButton("Fit H")
+        self.btn_fit_height.setFixedSize(55, 30)
+        self.btn_fit_height.clicked.connect(self.fit_to_height)
+        
         self.btn_fit = QPushButton("Fit")
         self.btn_fit.setFixedSize(50, 30)
         self.btn_fit.clicked.connect(self.fit_to_screen)
         
+        self.btn_close = QPushButton("✖")
+        self.btn_close.setFixedSize(40, 30)
+        self.btn_close.clicked.connect(self.close_self)
+        self.btn_close.setStyleSheet("background-color: #dc2626; color: white;")
+        
+        self.btn_popout = QPushButton("⬜")
+        self.btn_popout.setFixedSize(40, 30)
+        self.btn_popout.clicked.connect(self.pop_out)
+        
         zoom_layout.addWidget(self.btn_zoom_out)
         zoom_layout.addWidget(self.lbl_zoom)
         zoom_layout.addWidget(self.btn_zoom_in)
+        zoom_layout.addWidget(self.btn_fit_width)
+        zoom_layout.addWidget(self.btn_fit_height)
         zoom_layout.addWidget(self.btn_fit)
+        zoom_layout.addWidget(self.btn_close)
+        zoom_layout.addWidget(self.btn_popout)
         
         # Combine toolbars
         toolbar_layout.addLayout(nav_layout)
-        toolbar_layout.addStretch()
+        toolbar_layout.addWidget(self.lbl_filename, stretch=1)
         toolbar_layout.addLayout(zoom_layout)
         layout.addLayout(toolbar_layout)
         
@@ -163,6 +238,10 @@ class PDFTab(QWidget):
         self.render()
     
     def fit_to_screen(self):
+        """Fit to width (same as fit_to_width for backward compatibility)"""
+        self.fit_to_width()
+    
+    def fit_to_width(self):
         if not self.doc: return
         try:
             page = self.doc.load_page(self.current_page)
@@ -172,7 +251,34 @@ class PDFTab(QWidget):
             self.update_zoom_label()
             self.render()
         except Exception as e:
-            print(f"Fit error: {e}")
+            print(f"Fit width error: {e}")
+    
+    def fit_to_height(self):
+        if not self.doc: return
+        try:
+            page = self.doc.load_page(self.current_page)
+            page_height = page.rect.height
+            scroll_height = self.scroll.height() - 40  # Account for margins
+            self.scale = scroll_height / page_height
+            self.update_zoom_label()
+            self.render()
+        except Exception as e:
+            print(f"Fit height error: {e}")
+    
+    def close_self(self):
+        """Close this dock"""
+        if self.parent_dock:
+            # Find parent PDFEditorModule
+            parent = self.parent()
+            while parent and not isinstance(parent, PDFEditorModule):
+                parent = parent.parent()
+            if parent:
+                parent.close_tab(self.parent_dock)
+    
+    def pop_out(self):
+        """Pop out to floating window"""
+        if self.parent_dock:
+            self.parent_dock.setFloating(True)
     
     def update_zoom_label(self):
         zoom_pct = int(self.scale * 100)
@@ -205,10 +311,23 @@ class PDFTab(QWidget):
             self.label.setPixmap(QPixmap.fromImage(img))
         except Exception as e:
             print(f"Render error: {e}")
+    
+    def cleanup(self):
+        """Clean up temp files if this is a temp PDF"""
+        if self.is_temp and self.temp_path and os.path.exists(self.temp_path):
+            try:
+                os.remove(self.temp_path)
+                print(f"Deleted temp file: {self.temp_path}")
+            except Exception as e:
+                print(f"Failed to delete temp file: {e}")
+
 
 class PDFEditorModule(QWidget):
     def __init__(self):
         super().__init__()
+        # Create temp directory
+        self.temp_dir = os.path.join(os.getcwd(), ".temp_pdfs")
+        os.makedirs(self.temp_dir, exist_ok=True)
         self.setup_ui()
     
     def setup_ui(self):
@@ -221,13 +340,15 @@ class PDFEditorModule(QWidget):
         title.setObjectName("moduleTitle")
         title.setStyleSheet("font-size: 24px; font-weight: bold;")
         layout.addWidget(title)
-        
+
         # Toolbar
         toolbar = QHBoxLayout()
         toolbar.setSpacing(10)
-        
-        self.btn_open = self.create_btn("📂 Open", self.open_pdf)
-        self.btn_save = self.create_btn("💾 Save", self.save_pdf)
+
+        self.btn_open = self.create_btn("📂 Open (PDF/Office)", self.open_pdf)
+        self.btn_save = self.create_btn("💾 Save", lambda: self.save_pdf())
+        self.btn_close_all = self.create_btn("❌ Close All", self.close_all)
+        self.btn_ppt = self.create_btn("📊 PPT to PDF", self.ppt_to_pdf)
         self.btn_compress = self.create_btn("🗜️ Compress", self.compress_pdf)
         self.btn_merge = self.create_btn("📑 Merge", self.merge_pdfs)
         self.btn_split = self.create_btn("✂️ Split", self.split_pdf)
@@ -235,17 +356,41 @@ class PDFEditorModule(QWidget):
         self.btn_pagenum = self.create_btn("🔢 Add Page #", self.add_page_numbers)
         self.btn_header = self.create_btn("📝 Header/Footer", self.add_header_footer)
         
-        for btn in [self.btn_open, self.btn_save, self.btn_compress, self.btn_merge, self.btn_split, 
+        for btn in [self.btn_open, self.btn_save, self.btn_close_all, self.btn_ppt, self.btn_compress, self.btn_merge, self.btn_split, 
                    self.btn_redact, self.btn_pagenum, self.btn_header]:
             toolbar.addWidget(btn)
         toolbar.addStretch()
         layout.addLayout(toolbar)
         
-        # Tabs for Multiple PDFs
-        self.tabs = QTabWidget()
-        self.tabs.setTabsClosable(True)
-        self.tabs.tabCloseRequested.connect(self.close_tab)
-        layout.addWidget(self.tabs)
+        # Dock Manager (QMainWindow embedded)
+        self.dock_manager = QMainWindow()
+        self.dock_manager.setWindowFlags(Qt.Widget) # Embeddable
+        self.dock_manager.setDockOptions(
+            QMainWindow.AllowTabbedDocks | 
+            QMainWindow.AllowNestedDocks | 
+            QMainWindow.AnimatedDocks |
+            QMainWindow.GroupedDragging
+        )
+        
+        # Enable all dock orientations
+        self.dock_manager.setCorner(Qt.TopLeftCorner, Qt.LeftDockWidgetArea)
+        self.dock_manager.setCorner(Qt.TopRightCorner, Qt.RightDockWidgetArea)
+        self.dock_manager.setCorner(Qt.BottomLeftCorner, Qt.LeftDockWidgetArea)
+        self.dock_manager.setCorner(Qt.BottomRightCorner, Qt.RightDockWidgetArea)
+        
+        # Set tab position to bottom
+        self.dock_manager.setTabPosition(Qt.AllDockWidgetAreas, QTabWidget.South)
+        
+        # Central widget (minimal size to allow splits)
+        self.central_widget = QWidget()
+        self.central_widget.setMaximumSize(1, 1)
+        self.central_widget.setStyleSheet("background: transparent;")
+        self.dock_manager.setCentralWidget(self.central_widget)
+        
+        layout.addWidget(self.dock_manager)
+        
+        # Track open docs
+        self.docks = []
 
     def create_btn(self, text, callback):
         btn = QPushButton(text)
@@ -262,38 +407,130 @@ class PDFEditorModule(QWidget):
         return btn
     
     def current_tab(self):
-        return self.tabs.currentWidget()
+        # Find active dock
+        for dock in self.docks:
+            if dock.widget().hasFocus() or dock.isVisible():
+                return dock.widget() # Return PDFTab
+        if self.docks:
+            return self.docks[-1].widget()
+        return None
 
-    def close_tab(self, index):
-        widget = self.tabs.widget(index)
-        if widget:
-            widget.deleteLater()
-        self.tabs.removeTab(index)
+    def close_tab(self, dock):
+        if dock in self.docks:
+            # Cleanup temp files
+            tab = dock.widget()
+            if tab and hasattr(tab, 'cleanup'):
+                tab.cleanup()
+            
+            # Check for unsaved changes (mockup)
+            reply = QMessageBox.question(self, "Close", "Save changes before closing?", 
+                                       QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel)
+            if reply == QMessageBox.Cancel:
+                return
+            if reply == QMessageBox.Yes:
+                self.save_pdf(dock.widget())
+            
+            self.dock_manager.removeDockWidget(dock)
+            dock.deleteLater()
+            self.docks.remove(dock)
+
+    def close_all(self):
+        reply = QMessageBox.question(self, "Close All", "Close all tabs without saving?", 
+                                   QMessageBox.Yes | QMessageBox.No)
+        if reply == QMessageBox.Yes:
+            for dock in list(self.docks):
+                self.dock_manager.removeDockWidget(dock)
+                dock.deleteLater()
+            self.docks.clear()
 
     def open_pdf(self):
-        path, _ = QFileDialog.getOpenFileName(self, "Open PDF", "", "PDF Files (*.pdf)")
+        path, _ = QFileDialog.getOpenFileName(self, "Open File", "", "Files (*.pdf *.pptx *.xlsx *.docx)")
         if path:
             try:
+                is_temp = False
+                temp_path = None
+                original_path = path
+                
+                # Convert if Office file
+                if path.lower().endswith(('.pptx', '.xlsx', '.docx')):
+                    # Generate temp filename
+                    import uuid
+                    temp_filename = f"{uuid.uuid4().hex}.pdf"
+                    temp_path = os.path.join(self.temp_dir, temp_filename)
+                    
+                    # Convert to temp location
+                    import shutil
+                    converted_path = OfficeConverter.convert_to_pdf(path)
+                    if not converted_path:
+                        raise Exception("Conversion failed")
+                    
+                    shutil.move(converted_path, temp_path)
+                    path = temp_path
+                    is_temp = True
+                
                 doc = fitz.open(path)
-                tab = PDFTab(doc, path)
-                self.tabs.addTab(tab, os.path.basename(path))
-                self.tabs.setCurrentWidget(tab)
+                tab = PDFTab(doc, original_path, is_temp=is_temp, temp_path=temp_path)
+                
+                # Create Dock Widget
+                from PySide6.QtWidgets import QDockWidget
+                dock = QDockWidget(os.path.basename(original_path), self)
+                dock.setWidget(tab)
+                dock.setAllowedAreas(Qt.AllDockWidgetAreas)
+                dock.setFeatures(QDockWidget.DockWidgetMovable | QDockWidget.DockWidgetFloatable | QDockWidget.DockWidgetClosable)
+                
+                # Set parent_dock reference
+                tab.parent_dock = dock
+                
+                # Rename feature via context menu
+                dock.setContextMenuPolicy(Qt.CustomContextMenu)
+                dock.customContextMenuRequested.connect(lambda pos, d=dock: self.dock_context_menu(pos, d))
+                
+                self.dock_manager.addDockWidget(Qt.RightDockWidgetArea, dock)
+                if self.docks:
+                    self.dock_manager.tabifyDockWidget(self.docks[-1], dock)
+                
+                self.docks.append(dock)
+                dock.show()
+                
             except Exception as e:
-                QMessageBox.critical(self, "Error", f"Failed to open PDF: {e}")
+                QMessageBox.critical(self, "Error", f"Failed to open file: {e}")
+    
+    def dock_context_menu(self, pos, dock):
+        from PySide6.QtWidgets import QMenu
+        menu = QMenu()
+        rename_action = menu.addAction("Rename")
+        close_action = menu.addAction("Close")
+        action = menu.exec(dock.mapToGlobal(pos))
+        if action == rename_action:
+            new_name, ok = QInputDialog.getText(self, "Rename", "New Name:", text=dock.windowTitle())
+            if ok and new_name:
+                dock.setWindowTitle(new_name)
+        elif action == close_action:
+            self.close_tab(dock)
 
-    def save_pdf(self):
-        tab = self.current_tab()
+    def save_pdf(self, tab=None):
+        if not tab: tab = self.current_tab()
         if not tab: return
         path, _ = QFileDialog.getSaveFileName(self, "Save PDF", "", "PDF Files (*.pdf)")
         if path:
             try:
                 tab.doc.save(path)
                 QMessageBox.information(self, "Success", "PDF saved successfully!")
-                # Update tab name
-                idx = self.tabs.indexOf(tab)
-                self.tabs.setTabText(idx, os.path.basename(path))
+                # Update dock title
+                for dock in self.docks:
+                    if dock.widget() == tab:
+                        dock.setWindowTitle(os.path.basename(path))
             except Exception as e:
                 QMessageBox.critical(self, "Error", str(e))
+    
+    def ppt_to_pdf(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Select PPT", "", "PowerPoint (*.pptx *.ppt)")
+        if path:
+            pdf_path = OfficeConverter.convert_to_pdf(path)
+            if pdf_path:
+                QMessageBox.information(self, "Success", f"Converted to: {pdf_path}")
+            else:
+                QMessageBox.critical(self, "Error", "Conversion failed")
 
     def compress_pdf(self):
         tab = self.current_tab()
@@ -307,8 +544,25 @@ class PDFEditorModule(QWidget):
                 # Open result in new tab
                 new_doc = fitz.open(path)
                 new_tab = PDFTab(new_doc, path)
-                self.tabs.addTab(new_tab, os.path.basename(path))
-                self.tabs.setCurrentWidget(new_tab)
+                
+                # Create Dock Widget
+                from PySide6.QtWidgets import QDockWidget
+                dock = QDockWidget(os.path.basename(path), self)
+                dock.setWidget(new_tab)
+                dock.setAllowedAreas(Qt.AllDockWidgetAreas)
+                dock.setFeatures(QDockWidget.DockWidgetMovable | QDockWidget.DockWidgetFloatable | QDockWidget.DockWidgetClosable)
+                dock.setContextMenuPolicy(Qt.CustomContextMenu)
+                dock.customContextMenuRequested.connect(lambda pos, d=dock: self.dock_context_menu(pos, d))
+                
+                # Set parent_dock reference
+                new_tab.parent_dock = dock
+                
+                self.dock_manager.addDockWidget(Qt.RightDockWidgetArea, dock)
+                if self.docks:
+                    self.dock_manager.tabifyDockWidget(self.docks[-1], dock)
+                self.docks.append(dock)
+                dock.show()
+                
                 QMessageBox.information(self, "Success", "Compressed PDF opened in new tab!")
             except Exception as e:
                 QMessageBox.critical(self, "Error", str(e))
@@ -449,8 +703,25 @@ class PDFEditorModule(QWidget):
                     doc.close()
                 
                 tab = PDFTab(merged, "Merged.pdf")
-                self.tabs.addTab(tab, "Merged.pdf")
-                self.tabs.setCurrentWidget(tab)
+                
+                # Create Dock Widget
+                from PySide6.QtWidgets import QDockWidget
+                dock = QDockWidget("Merged.pdf", self)
+                dock.setWidget(tab)
+                dock.setAllowedAreas(Qt.AllDockWidgetAreas)
+                dock.setFeatures(QDockWidget.DockWidgetMovable | QDockWidget.DockWidgetFloatable | QDockWidget.DockWidgetClosable)
+                dock.setContextMenuPolicy(Qt.CustomContextMenu)
+                dock.customContextMenuRequested.connect(lambda pos, d=dock: self.dock_context_menu(pos, d))
+                
+                # Set parent_dock reference
+                tab.parent_dock = dock
+                
+                self.dock_manager.addDockWidget(Qt.RightDockWidgetArea, dock)
+                if self.docks:
+                    self.dock_manager.tabifyDockWidget(self.docks[-1], dock)
+                self.docks.append(dock)
+                dock.show()
+                
                 QMessageBox.information(self, "Success", f"Merged {page_listwidget.count()} pages!")
             except Exception as e:
                 QMessageBox.critical(self, "Error", str(e))
@@ -682,8 +953,25 @@ class PDFEditorModule(QWidget):
                 base_doc.close()
                 
                 tab = PDFTab(merged, "Merged_Headers.pdf")
-                self.tabs.addTab(tab, "Merged_Headers.pdf")
-                self.tabs.setCurrentWidget(tab)
+                
+                # Create Dock Widget
+                from PySide6.QtWidgets import QDockWidget
+                dock = QDockWidget("Merged_Headers.pdf", self)
+                dock.setWidget(tab)
+                dock.setAllowedAreas(Qt.AllDockWidgetAreas)
+                dock.setFeatures(QDockWidget.DockWidgetMovable | QDockWidget.DockWidgetFloatable | QDockWidget.DockWidgetClosable)
+                dock.setContextMenuPolicy(Qt.CustomContextMenu)
+                dock.customContextMenuRequested.connect(lambda pos, d=dock: self.dock_context_menu(pos, d))
+                
+                # Set parent_dock reference
+                tab.parent_dock = dock
+                
+                self.dock_manager.addDockWidget(Qt.RightDockWidgetArea, dock)
+                if self.docks:
+                    self.dock_manager.tabifyDockWidget(self.docks[-1], dock)
+                self.docks.append(dock)
+                dock.show()
+                
                 QMessageBox.information(self, "Success", "Header-based merge complete!")
             except Exception as e:
                 QMessageBox.critical(self, "Error", str(e))
@@ -741,8 +1029,25 @@ class PDFEditorModule(QWidget):
                     new_doc.insert_pdf(tab.doc, from_page=page_num, to_page=page_num)
                 
                 new_tab = PDFTab(new_doc, "Split.pdf")
-                self.tabs.addTab(new_tab, "Split.pdf")
-                self.tabs.setCurrentWidget(new_tab)
+                
+                # Create Dock Widget
+                from PySide6.QtWidgets import QDockWidget
+                dock = QDockWidget("Split.pdf", self)
+                dock.setWidget(new_tab)
+                dock.setAllowedAreas(Qt.AllDockWidgetAreas)
+                dock.setFeatures(QDockWidget.DockWidgetMovable | QDockWidget.DockWidgetFloatable | QDockWidget.DockWidgetClosable)
+                dock.setContextMenuPolicy(Qt.CustomContextMenu)
+                dock.customContextMenuRequested.connect(lambda pos, d=dock: self.dock_context_menu(pos, d))
+                
+                # Set parent_dock reference
+                new_tab.parent_dock = dock
+                
+                self.dock_manager.addDockWidget(Qt.RightDockWidgetArea, dock)
+                if self.docks:
+                    self.dock_manager.tabifyDockWidget(self.docks[-1], dock)
+                self.docks.append(dock)
+                dock.show()
+                
                 QMessageBox.information(self, "Success", f"Split {len(pages)} pages into new tab!")
             except Exception as e:
                 QMessageBox.critical(self, "Error", str(e))
@@ -867,8 +1172,17 @@ class PDFEditorModule(QWidget):
         if not tab: return
             
         dialog = QDialog(self)
-        dialog.setWindowTitle("Add Header/Footer")
+        dialog.setWindowTitle("Add/Remove Header/Footer")
+        dialog.resize(450, 350)
         layout = QVBoxLayout(dialog)
+        
+        # Remove Button at top
+        btn_remove = QPushButton("🗑️ Remove All Headers/Footers")
+        btn_remove.setStyleSheet("background-color: #dc2626; color: white; padding: 8px;")
+        btn_remove.clicked.connect(lambda: self.remove_header_footer(tab, dialog))
+        layout.addWidget(btn_remove)
+        
+        layout.addWidget(QLabel("<hr>"))
         
         # Preset Button
         btn_draft = QPushButton("Load 'DRAFT' Preset")
@@ -887,6 +1201,21 @@ class PDFEditorModule(QWidget):
         align_combo = QComboBox()
         align_combo.addItems(["Center", "Left", "Right"])
         layout.addWidget(align_combo)
+        
+        # Font Selection
+        font_layout = QHBoxLayout()
+        font_layout.addWidget(QLabel("Font:"))
+        font_combo = QComboBox()
+        font_combo.addItems([
+            "Times New Roman",
+            "Times-Roman", 
+            "Helvetica",
+            "Courier",
+            "Arial"
+        ])
+        font_combo.setCurrentText("Times New Roman")  # Default
+        font_layout.addWidget(font_combo)
+        layout.addLayout(font_layout)
         
         # Styling
         style_layout = QHBoxLayout()
@@ -909,6 +1238,7 @@ class PDFEditorModule(QWidget):
             text_input.setText("DRAFT")
             type_combo.setCurrentText("Header")
             align_combo.setCurrentText("Center")
+            font_combo.setCurrentText("Times New Roman")
             size_spin.setValue(26)
             color_combo.setCurrentText("Red")
         
@@ -929,6 +1259,17 @@ class PDFEditorModule(QWidget):
                 align = align_combo.currentText()
                 size = size_spin.value()
                 color_name = color_combo.currentText().lower()
+                font_name = font_combo.currentText()
+                
+                # Map to PyMuPDF font names
+                font_map = {
+                    "Times New Roman": "times-roman",
+                    "Times-Roman": "times-roman",
+                    "Helvetica": "helv",
+                    "Courier": "cour",
+                    "Arial": "helv"  # Arial maps to Helvetica
+                }
+                fontname = font_map.get(font_name, "times-roman")
                 
                 # Map color names to RGB tuples
                 colors = {
@@ -951,12 +1292,42 @@ class PDFEditorModule(QWidget):
                     elif align == "Left": x = 20
                     else: x = rect.width - 20 - text_width
                     
-                    page.insert_text(fitz.Point(x, y), text, fontsize=size, color=color)
+                    page.insert_text(fitz.Point(x, y), text, fontname=fontname, fontsize=size, color=color)
                 
                 tab.render()
                 QMessageBox.information(self, "Success", "Header/Footer added! Preview updated.")
             except Exception as e:
                 QMessageBox.critical(self, "Error", str(e))
+    
+    def remove_header_footer(self, tab, parent_dialog):
+        """Remove all text from header/footer regions"""
+        try:
+            doc = tab.doc
+            removed_count = 0
+            
+            for page in doc:
+                rect = page.rect
+                # Define header and footer regions (top 50px and bottom 50px)
+                header_rect = fitz.Rect(0, 0, rect.width, 50)
+                footer_rect = fitz.Rect(0, rect.height - 50, rect.width, rect.height)
+                
+                # Redact text in these regions
+                for region in [header_rect, footer_rect]:
+                    blocks = page.get_text("dict", clip=region)["blocks"]
+                    for block in blocks:
+                        if "lines" in block:
+                            for line in block["lines"]:
+                                for span in line["spans"]:
+                                    bbox = fitz.Rect(span["bbox"])
+                                    page.add_redact_annot(bbox, fill=(1, 1, 1))
+                                    removed_count += 1
+                    page.apply_redactions()
+            
+            tab.render()
+            parent_dialog.accept()
+            QMessageBox.information(self, "Success", f"Removed text from header/footer regions!")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", str(e))
 
 # ============================================================================
 # OCR TRAINER MODULE
@@ -1838,13 +2209,13 @@ class MailDrafterModule(QWidget):
     def refresh_attachments(self):
         self.attach_list.clear()
         from PySide6.QtWidgets import QListWidgetItem # Import locally to avoid NameError
-        tabs = self.pdf_editor.tabs
-        for i in range(tabs.count()):
-            tab_name = tabs.tabText(i)
+        docks = self.pdf_editor.docks
+        for i, dock in enumerate(docks):
+            tab_name = dock.windowTitle()
             item = QListWidgetItem(tab_name)
             item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
             item.setCheckState(Qt.Unchecked)
-            item.setData(Qt.UserRole, i) # Store tab index
+            item.setData(Qt.UserRole, i) # Store dock index
             self.attach_list.addItem(item)
     
     def generate_draft(self):
@@ -1865,14 +2236,16 @@ class MailDrafterModule(QWidget):
             
             # 2. Save Attachments
             attachments = []
-            tabs = self.pdf_editor.tabs
+            docks = self.pdf_editor.docks
             for i in range(self.attach_list.count()):
                 item = self.attach_list.item(i)
                 if item.checkState() == Qt.Checked:
-                    tab_idx = item.data(Qt.UserRole)
-                    tab = tabs.widget(tab_idx)
-                    if tab and tab.doc:
-                        filename = tabs.tabText(tab_idx)
+                    dock_idx = item.data(Qt.UserRole)
+                    if 0 <= dock_idx < len(docks):
+                        dock = docks[dock_idx]
+                        tab = dock.widget()
+                        if tab and tab.doc:
+                            filename = dock.windowTitle()
                         if not filename.lower().endswith(".pdf"):
                             filename += ".pdf"
                         save_path = os.path.join(folder_path, filename)
