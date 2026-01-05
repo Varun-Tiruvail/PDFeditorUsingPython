@@ -10,8 +10,9 @@ from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
                                QTableWidgetItem, QLineEdit, QSpinBox, QComboBox,
                                QTextEdit, QListWidget, QDialog, QDialogButtonBox,
                                QMessageBox, QGraphicsScene, QGraphicsView,
-                               QGraphicsRectItem, QTabWidget, QMainWindow, QInputDialog)
-from PySide6.QtCore import Qt, QPointF, QRectF, Signal, QThread
+                               QGraphicsRectItem, QTabWidget, QMainWindow, QInputDialog,
+                               QRubberBand)
+from PySide6.QtCore import Qt, QPointF, QRectF, Signal, QThread, QPoint, QRect, QSize
 from PySide6.QtGui import QPixmap, QImage, QPen, QColor, QBrush
 from sqlalchemy import create_engine, Column, Integer, String, Float, ForeignKey, Boolean, DateTime
 from sqlalchemy.ext.declarative import declarative_base
@@ -121,6 +122,42 @@ class Job(Base):
 Base.metadata.create_all(engine)
 
 # ============================================================================
+# UTILITY CLASSES
+# ============================================================================
+
+class PDFCanvas(QLabel):
+    """Custom label that supports drawing a selection rectangle"""
+    selection_completed = Signal(QRect)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.rubber_band = QRubberBand(QRubberBand.Rectangle, self)
+        self.origin = QPoint()
+        self.selection_mode = False
+
+    def set_selection_mode(self, enabled):
+        self.selection_mode = enabled
+        if not enabled:
+            self.rubber_band.hide()
+
+    def mousePressEvent(self, event):
+        if self.selection_mode and event.button() == Qt.LeftButton:
+            self.origin = event.position().toPoint()
+            self.rubber_band.setGeometry(QRect(self.origin, QSize()))
+            self.rubber_band.show()
+
+    def mouseMoveEvent(self, event):
+        if self.selection_mode and not self.origin.isNull():
+            self.rubber_band.setGeometry(QRect(self.origin, event.position().toPoint()).normalized())
+
+    def mouseReleaseEvent(self, event):
+        if self.selection_mode and event.button() == Qt.LeftButton:
+            rect = self.rubber_band.geometry()
+            self.rubber_band.hide()
+            self.origin = QPoint()
+            self.selection_completed.emit(rect)
+
+# ============================================================================
 # PDF EDITOR MODULE
 # ============================================================================
 
@@ -135,6 +172,16 @@ class PDFTab(QWidget):
         self.temp_path = temp_path
         self.parent_dock = None  # Will be set by PDFEditorModule
         self.setup_ui()
+        self.setFocusPolicy(Qt.ClickFocus)
+
+    def focusInEvent(self, event):
+        super().focusInEvent(event)
+        # Notify parent PDFEditorModule that this tab is active
+        parent = self.parent()
+        while parent and not isinstance(parent, PDFEditorModule):
+            parent = parent.parent()
+        if parent:
+            parent._last_active_tab = self
 
     def setup_ui(self):
         layout = QVBoxLayout(self)
@@ -219,13 +266,23 @@ class PDFTab(QWidget):
         
         # Scroll Area
         self.scroll = QScrollArea()
-        self.label = QLabel()
+        self.label = PDFCanvas()
         self.label.setAlignment(Qt.AlignCenter)
+        self.label.selection_completed.connect(self.handle_selection)
         self.scroll.setWidget(self.label)
         self.scroll.setWidgetResizable(True)
         layout.addWidget(self.scroll)
         
         self.render()
+
+    def handle_selection(self, rect):
+        """Handle redaction selection from canvas"""
+        # Find parent PDFEditorModule
+        parent = self.parent()
+        while parent and not isinstance(parent, PDFEditorModule):
+            parent = parent.parent()
+        if parent:
+            parent.apply_custom_redaction(self, rect)
     
     def zoom_in(self):
         self.scale *= 1.2
@@ -313,7 +370,14 @@ class PDFTab(QWidget):
             print(f"Render error: {e}")
     
     def cleanup(self):
-        """Clean up temp files if this is a temp PDF"""
+        """Clean up temp files and close document"""
+        if self.doc:
+            try:
+                self.doc.close()
+                self.doc = None
+            except Exception as e:
+                print(f"Failed to close doc: {e}")
+
         if self.is_temp and self.temp_path and os.path.exists(self.temp_path):
             try:
                 os.remove(self.temp_path)
@@ -328,6 +392,7 @@ class PDFEditorModule(QWidget):
         # Create temp directory
         self.temp_dir = os.path.join(os.getcwd(), ".temp_pdfs")
         os.makedirs(self.temp_dir, exist_ok=True)
+        self._last_active_tab = None
         self.setup_ui()
     
     def setup_ui(self):
@@ -352,12 +417,13 @@ class PDFEditorModule(QWidget):
         self.btn_compress = self.create_btn("🗜️ Compress", self.compress_pdf)
         self.btn_merge = self.create_btn("📑 Merge", self.merge_pdfs)
         self.btn_split = self.create_btn("✂️ Split", self.split_pdf)
-        self.btn_redact = self.create_btn("🚫 Redact Page #", self.redact_page_numbers)
+        self.btn_redact = self.create_btn("🚫 Redact Auto", self.redact_page_numbers)
+        self.btn_redact_custom = self.create_btn("🎯 Redact Custom", self.redact_custom_location)
         self.btn_pagenum = self.create_btn("🔢 Add Page #", self.add_page_numbers)
         self.btn_header = self.create_btn("📝 Header/Footer", self.add_header_footer)
         
         for btn in [self.btn_open, self.btn_save, self.btn_close_all, self.btn_ppt, self.btn_compress, self.btn_merge, self.btn_split, 
-                   self.btn_redact, self.btn_pagenum, self.btn_header]:
+                   self.btn_redact, self.btn_redact_custom, self.btn_pagenum, self.btn_header]:
             toolbar.addWidget(btn)
         toolbar.addStretch()
         layout.addLayout(toolbar)
@@ -407,12 +473,24 @@ class PDFEditorModule(QWidget):
         return btn
     
     def current_tab(self):
-        # Find active dock
+        # 1. Check if a tab currently has focus
+        from PySide6.QtWidgets import QApplication
+        focus_widget = QApplication.focusWidget()
         for dock in self.docks:
-            if dock.widget().hasFocus() or dock.isVisible():
-                return dock.widget() # Return PDFTab
-        if self.docks:
-            return self.docks[-1].widget()
+            tab = dock.widget()
+            if tab == focus_widget or tab.isAncestorOf(focus_widget):
+                self._last_active_tab = tab
+                return tab
+        
+        # 2. Return last known active tab if it's still alive and visible
+        if self._last_active_tab and self._last_active_tab in [d.widget() for d in self.docks]:
+            if self._last_active_tab.isVisible():
+                return self._last_active_tab
+        
+        # 3. Fallback to first visible dock
+        for dock in self.docks:
+            if dock.isVisible():
+                return dock.widget()
         return None
 
     def close_tab(self, dock):
@@ -1092,6 +1170,81 @@ class PDFEditorModule(QWidget):
         except Exception as e:
             QMessageBox.critical(self, "Error", str(e))
 
+    def redact_custom_location(self):
+        tab = self.current_tab()
+        if not tab:
+            QMessageBox.warning(self, "No PDF", "Please open a PDF first.")
+            return
+        
+        tab.label.set_selection_mode(True)
+        tab.label.setCursor(Qt.CrossCursor)
+        QMessageBox.information(self, "Custom Redaction", "Draw a box around the area you wish to redact.")
+
+    def apply_custom_redaction(self, tab, ui_rect):
+        tab.label.set_selection_mode(False)
+        tab.label.setCursor(Qt.ArrowCursor)
+        
+        if ui_rect.width() < 5 or ui_rect.height() < 5:
+            return
+
+        pixmap = tab.label.pixmap()
+        if not pixmap or pixmap.isNull():
+            return
+
+        try:
+            # Map UI coordinates to PDF coordinates
+            # ui_rect is relative to the QLabel (which might be larger than pixmap due to centering)
+            pixmap_rect = pixmap.rect()
+            label_rect = tab.label.rect()
+            
+            # Center offset
+            offset_x = (label_rect.width() - pixmap_rect.width()) / 2
+            offset_y = (label_rect.height() - pixmap_rect.height()) / 2
+            
+            # PDF coordinates
+            page = tab.doc.load_page(tab.current_page)
+            pdf_w, pdf_h = page.rect.width, page.rect.height
+            
+            x0 = (ui_rect.left() - offset_x) / tab.scale
+            y0 = (ui_rect.top() - offset_y) / tab.scale
+            x1 = (ui_rect.right() - offset_x) / tab.scale
+            y1 = (ui_rect.bottom() - offset_y) / tab.scale
+            
+            # Target rect on current page
+            target_rect = fitz.Rect(x0, y0, x1, y1)
+            
+            # Calculate offsets from bottom and right
+            dist_right = pdf_w - x1
+            dist_bottom = pdf_h - y1
+            rect_w = x1 - x0
+            rect_h = y1 - y0
+
+            reply = QMessageBox.question(self, "Confirm Redaction", 
+                                       "Redact this area on all pages?",
+                                       QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel)
+            
+            if reply == QMessageBox.Cancel: return
+            
+            if reply == QMessageBox.Yes:
+                for pg in tab.doc:
+                    # Calculate position on this specific page based on bottom-right distance
+                    p_w, p_h = pg.rect.width, pg.rect.height
+                    pg_x1 = p_w - dist_right
+                    pg_y1 = p_h - dist_bottom
+                    pg_x0 = pg_x1 - rect_w
+                    pg_y0 = pg_y1 - rect_h
+                    
+                    pg.add_redact_annot(fitz.Rect(pg_x0, pg_y0, pg_x1, pg_y1), fill=(1, 1, 1))
+                    pg.apply_redactions()
+            else:
+                page.add_redact_annot(target_rect, fill=(1, 1, 1))
+                page.apply_redactions()
+            
+            tab.render()
+            QMessageBox.information(self, "Success", "Redaction applied.")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Redaction failed: {e}")
+
     def add_page_numbers(self):
         tab = self.current_tab()
         if not tab: return
@@ -1105,9 +1258,13 @@ class PDFEditorModule(QWidget):
         fmt_combo.addItems(["Page n of n", "n"])
         layout.addWidget(fmt_combo)
         
-        layout.addWidget(QLabel("Exclude Pages (e.g. 1, 3-5):"))
-        exclude_input = QLineEdit()
-        layout.addWidget(exclude_input)
+        layout.addWidget(QLabel("Skip Pages (No Number, No Count - e.g. 1, 3-5):"))
+        skip_input = QLineEdit()
+        layout.addWidget(skip_input)
+
+        layout.addWidget(QLabel("Omit Numbers (Count continues, but hide text - e.g. 2, 6):"))
+        omit_input = QLineEdit()
+        layout.addWidget(omit_input)
         
         layout.addWidget(QLabel("Position:"))
         pos_combo = QComboBox()
@@ -1125,42 +1282,54 @@ class PDFEditorModule(QWidget):
         buttons.rejected.connect(dialog.reject)
         layout.addWidget(buttons)
         
+        def parse_pages(p_str):
+            pages = set()
+            if not p_str: return pages
+            for part in p_str.split(','):
+                try:
+                    if '-' in part:
+                        start, end = map(int, part.strip().split('-'))
+                        pages.update(range(start, end + 1))
+                    else:
+                        pages.add(int(part.strip()))
+                except: pass
+            return pages
+
         if dialog.exec() == QDialog.Accepted:
             try:
                 doc = tab.doc
-                exclude_str = exclude_input.text().strip()
-                excluded = set()
-                if exclude_str:
-                    for part in exclude_str.split(','):
-                        if '-' in part:
-                            start, end = map(int, part.split('-'))
-                            excluded.update(range(start, end + 1))
-                        else:
-                            excluded.add(int(part))
+                skipped = parse_pages(skip_input.text())
+                omitted = parse_pages(omit_input.text())
                 
-                total = len(doc)
+                total_eligible = len(doc) - len([p for p in skipped if 1 <= p <= len(doc)])
                 fmt = fmt_combo.currentText()
                 font_size = size_spin.value()
                 
+                current_seq_num = 1
                 for i, page in enumerate(doc):
-                    pg_num = i + 1
-                    if pg_num in excluded: continue
+                    pg_index = i + 1
                     
-                    if fmt == "n":
-                        text = f"{pg_num}"
-                    else:
-                        text = f"Page {pg_num} of {total}"
-                        
-                    rect = page.rect
-                    pos_idx = pos_combo.currentIndex()
+                    if pg_index in skipped:
+                        continue
                     
-                    if pos_idx == 0: pt = fitz.Point(rect.width/2 - 30, rect.height - 20)
-                    elif pos_idx == 1: pt = fitz.Point(rect.width - 80, rect.height - 20)
-                    elif pos_idx == 2: pt = fitz.Point(20, rect.height - 20)
-                    elif pos_idx == 3: pt = fitz.Point(rect.width/2 - 30, 30)
-                    else: pt = fitz.Point(rect.width - 80, 30)
+                    if pg_index not in omitted:
+                        if fmt == "n":
+                            text = f"{current_seq_num}"
+                        else:
+                            text = f"Page {current_seq_num} of {total_eligible}"
+                            
+                        rect = page.rect
+                        pos_idx = pos_combo.currentIndex()
                         
-                    page.insert_text(pt, text, fontsize=font_size, color=(0, 0, 0))
+                        if pos_idx == 0: pt = fitz.Point(rect.width/2 - 30, rect.height - 20)
+                        elif pos_idx == 1: pt = fitz.Point(rect.width - 80, rect.height - 20)
+                        elif pos_idx == 2: pt = fitz.Point(20, rect.height - 20)
+                        elif pos_idx == 3: pt = fitz.Point(rect.width/2 - 30, 30)
+                        else: pt = fitz.Point(rect.width - 80, 30)
+                            
+                        page.insert_text(pt, text, fontsize=font_size, color=(0, 0, 0))
+                    
+                    current_seq_num += 1
                 
                 tab.render()
                 QMessageBox.information(self, "Success", "Page numbers added! Preview updated.")
@@ -2246,11 +2415,11 @@ class MailDrafterModule(QWidget):
                         tab = dock.widget()
                         if tab and tab.doc:
                             filename = dock.windowTitle()
-                        if not filename.lower().endswith(".pdf"):
-                            filename += ".pdf"
-                        save_path = os.path.join(folder_path, filename)
-                        tab.doc.save(save_path)
-                        attachments.append(save_path)
+                            if not filename.lower().endswith(".pdf"):
+                                filename += ".pdf"
+                            save_path = os.path.join(folder_path, filename)
+                            tab.doc.save(save_path)
+                            attachments.append(save_path)
             
             # 3. Create Outlook Item
             outlook = win32com.client.Dispatch("Outlook.Application")
