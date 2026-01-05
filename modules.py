@@ -183,6 +183,10 @@ class PDFTab(QWidget):
         if parent:
             parent._last_active_tab = self
 
+    def mousePressEvent(self, event):
+        self.setFocus()
+        super().mousePressEvent(event)
+
     def setup_ui(self):
         layout = QVBoxLayout(self)
         
@@ -473,24 +477,41 @@ class PDFEditorModule(QWidget):
         return btn
     
     def current_tab(self):
-        # 1. Check if a tab currently has focus
-        from PySide6.QtWidgets import QApplication
+        from PySide6.QtWidgets import QApplication, QTabBar
+        
+        # 1. Check if any tab's child widget currently has focus
         focus_widget = QApplication.focusWidget()
-        for dock in self.docks:
-            tab = dock.widget()
-            if tab == focus_widget or tab.isAncestorOf(focus_widget):
-                self._last_active_tab = tab
-                return tab
+        if focus_widget:
+            for dock in self.docks:
+                tab = dock.widget()
+                if tab == focus_widget or tab.isAncestorOf(focus_widget):
+                    self._last_active_tab = tab
+                    return tab
         
-        # 2. Return last known active tab if it's still alive and visible
+        # 2. Find the active dock in a tabbed group by finding tab bars
+        # In Qt, when docks are tabbed, there's a QTabBar child of the dock area
+        for child in self.dock_manager.findChildren(QTabBar):
+            current_index = child.currentIndex()
+            if current_index >= 0:
+                # Get the text of the current tab to match with dock titles
+                tab_text = child.tabText(current_index)
+                for dock in self.docks:
+                    if dock.windowTitle() == tab_text:
+                        self._last_active_tab = dock.widget()
+                        return dock.widget()
+        
+        # 3. Fall back to last known active tab
         if self._last_active_tab and self._last_active_tab in [d.widget() for d in self.docks]:
-            if self._last_active_tab.isVisible():
-                return self._last_active_tab
-        
-        # 3. Fallback to first visible dock
+            return self._last_active_tab
+
+        # 4. Fallback: Return first visible dock
         for dock in self.docks:
-            if dock.isVisible():
+            if dock.isVisible() and not dock.isHidden():
                 return dock.widget()
+        
+        # 5. Last resort: just the latest dock
+        if self.docks:
+            return self.docks[-1].widget()
         return None
 
     def close_tab(self, dock):
@@ -520,6 +541,14 @@ class PDFEditorModule(QWidget):
                 self.dock_manager.removeDockWidget(dock)
                 dock.deleteLater()
             self.docks.clear()
+            self._last_active_tab = None
+
+    def on_dock_visibility_changed(self, visible):
+        """Track active dock using visibility signals"""
+        if visible:
+            dock = self.sender()
+            if dock and not dock.isFloating():
+                self._last_active_tab = dock.widget()
 
     def open_pdf(self):
         path, _ = QFileDialog.getOpenFileName(self, "Open File", "", "Files (*.pdf *.pptx *.xlsx *.docx)")
@@ -563,12 +592,18 @@ class PDFEditorModule(QWidget):
                 dock.setContextMenuPolicy(Qt.CustomContextMenu)
                 dock.customContextMenuRequested.connect(lambda pos, d=dock: self.dock_context_menu(pos, d))
                 
+                # Signal for active tab tracking
+                dock.visibilityChanged.connect(self.on_dock_visibility_changed)
+                
                 self.dock_manager.addDockWidget(Qt.RightDockWidgetArea, dock)
                 if self.docks:
                     self.dock_manager.tabifyDockWidget(self.docks[-1], dock)
                 
                 self.docks.append(dock)
                 dock.show()
+                # Explicitly set as active if it's the only one
+                if len(self.docks) == 1:
+                    self._last_active_tab = tab
                 
             except Exception as e:
                 QMessageBox.critical(self, "Error", f"Failed to open file: {e}")
