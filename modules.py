@@ -1341,13 +1341,16 @@ class PDFEditorModule(QWidget):
                 font_size = size_spin.value()
                 
                 current_seq_num = 1
-                for i, page in enumerate(doc):
+                for i in range(len(doc)):
                     pg_index = i + 1
                     
                     if pg_index in skipped:
                         continue
                     
                     if pg_index not in omitted:
+                        # Load page properly to avoid stale reference
+                        page = doc.load_page(i)
+                        
                         if fmt == "n":
                             text = f"{current_seq_num}"
                         else:
