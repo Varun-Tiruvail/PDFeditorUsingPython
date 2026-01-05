@@ -1172,8 +1172,16 @@ class PDFEditorModule(QWidget):
         try:
             doc = tab.doc
             count = 0
+            # Enhanced patterns to catch more page number formats including semi-bold
             patterns = [
-                r"^\d+$", r"^Page\s+\d+$", r"^\d+\s+of\s+\d+$", r"^Page\s+\d+\s+of\s+\d+$"
+                r"^\d+$",                          # Just number: 1, 2, 3
+                r"^Page\s*\d+$",                   # Page 1, Page1
+                r"^\d+\s*of\s*\d+$",               # 1 of 10
+                r"^Page\s*\d+\s*of\s*\d+$",        # Page 1 of 10
+                r"^-\s*\d+\s*-$",                  # - 1 -
+                r"^\[\d+\]$",                      # [1]
+                r"^\(\d+\)$",                      # (1)
+                r"^p\.?\s*\d+$",                   # p.1, p 1
             ]
             
             for page in doc:
@@ -1365,7 +1373,7 @@ class PDFEditorModule(QWidget):
                         elif pos_idx == 3: pt = fitz.Point(rect.width/2 - 30, 30)
                         else: pt = fitz.Point(rect.width - 80, 30)
                             
-                        page.insert_text(pt, text, fontsize=font_size, color=(0, 0, 0))
+                        page.insert_text(pt, text, fontname="times-roman", fontsize=font_size, color=(0, 0, 0))
                     
                     current_seq_num += 1
                 
@@ -1507,32 +1515,48 @@ class PDFEditorModule(QWidget):
                 QMessageBox.critical(self, "Error", str(e))
     
     def remove_header_footer(self, tab, parent_dialog):
-        """Remove all text from header/footer regions"""
+        """Remove header/footer text matching common patterns (page numbers, dates, etc.)"""
         try:
             doc = tab.doc
             removed_count = 0
             
+            # Patterns that identify header/footer content
+            hf_patterns = [
+                r"^\d+$",                          # Just number
+                r"^Page\s*\d+",                    # Page 1...
+                r"^\d+\s*of\s*\d+$",               # 1 of 10
+                r"^-\s*\d+\s*-$",                  # - 1 -
+                r"^\[\d+\]$",                      # [1]
+                r"^\(\d+\)$",                      # (1)
+                r"^\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4}$",  # Dates
+                r"^(Draft|Confidential|Private)$",  # Common watermarks
+            ]
+            
             for page in doc:
                 rect = page.rect
-                # Define header and footer regions (top 50px and bottom 50px)
-                header_rect = fitz.Rect(0, 0, rect.width, 50)
-                footer_rect = fitz.Rect(0, rect.height - 50, rect.width, rect.height)
+                # Define header and footer regions (top 60px and bottom 60px)
+                header_rect = fitz.Rect(0, 0, rect.width, 60)
+                footer_rect = fitz.Rect(0, rect.height - 60, rect.width, rect.height)
                 
-                # Redact text in these regions
                 for region in [header_rect, footer_rect]:
                     blocks = page.get_text("dict", clip=region)["blocks"]
                     for block in blocks:
                         if "lines" in block:
                             for line in block["lines"]:
                                 for span in line["spans"]:
-                                    bbox = fitz.Rect(span["bbox"])
-                                    page.add_redact_annot(bbox, fill=(1, 1, 1))
-                                    removed_count += 1
-                    page.apply_redactions()
+                                    text = span["text"].strip()
+                                    # Only remove if it matches a header/footer pattern
+                                    for pat in hf_patterns:
+                                        if re.match(pat, text, re.IGNORECASE):
+                                            bbox = fitz.Rect(span["bbox"])
+                                            page.add_redact_annot(bbox, fill=(1, 1, 1))
+                                            removed_count += 1
+                                            break
+                page.apply_redactions()
             
             tab.render()
             parent_dialog.accept()
-            QMessageBox.information(self, "Success", f"Removed text from header/footer regions!")
+            QMessageBox.information(self, "Success", f"Removed {removed_count} header/footer items!")
         except Exception as e:
             QMessageBox.critical(self, "Error", str(e))
 
@@ -2372,14 +2396,30 @@ class MailDrafterModule(QWidget):
         title.setStyleSheet("font-size: 24px; font-weight: bold;")
         form_layout.addWidget(title)
         
+        # Template controls
+        template_row = QHBoxLayout()
+        self.template_combo = QComboBox()
+        self.template_combo.addItem("-- Select Template --")
+        self.template_combo.currentIndexChanged.connect(self.load_template)
+        template_row.addWidget(self.template_combo)
+        btn_save_template = QPushButton("💾 Save as Template")
+        btn_save_template.clicked.connect(self.save_template)
+        template_row.addWidget(btn_save_template)
+        form_layout.addLayout(template_row)
+        
         form_layout.addWidget(QLabel("From (Send on Behalf):"))
         self.from_input = QLineEdit()
-        self.from_input.setPlaceholderText("Optional: email@address.com")
+        self.from_input.setPlaceholderText("Optional: shared.mailbox@company.com")
         form_layout.addWidget(self.from_input)
         
         form_layout.addWidget(QLabel("To:"))
         self.to_input = QLineEdit()
         form_layout.addWidget(self.to_input)
+        
+        form_layout.addWidget(QLabel("CC:"))
+        self.cc_input = QLineEdit()
+        self.cc_input.setPlaceholderText("Optional: cc1@email.com; cc2@email.com")
+        form_layout.addWidget(self.cc_input)
         
         form_layout.addWidget(QLabel("Subject:"))
         self.subject_input = QLineEdit()
@@ -2412,6 +2452,7 @@ class MailDrafterModule(QWidget):
         layout.addWidget(attach_panel, stretch=1)
         
         self.refresh_attachments()
+        self.load_templates()
     
     def refresh_attachments(self):
         self.attach_list.clear()
@@ -2424,6 +2465,50 @@ class MailDrafterModule(QWidget):
             item.setCheckState(Qt.Unchecked)
             item.setData(Qt.UserRole, i) # Store dock index
             self.attach_list.addItem(item)
+
+    def load_templates(self):
+        """Load saved mail templates from disk"""
+        self.template_combo.clear()
+        self.template_combo.addItem("-- Select Template --")
+        template_dir = os.path.join(os.getcwd(), "MailTemplates")
+        if os.path.exists(template_dir):
+            for f in os.listdir(template_dir):
+                if f.endswith(".json"):
+                    self.template_combo.addItem(f.replace(".json", ""))
+
+    def save_template(self):
+        """Save current form as a template"""
+        import json
+        name, ok = QInputDialog.getText(self, "Save Template", "Template Name:")
+        if ok and name:
+            template_dir = os.path.join(os.getcwd(), "MailTemplates")
+            os.makedirs(template_dir, exist_ok=True)
+            data = {
+                "from": self.from_input.text(),
+                "to": self.to_input.text(),
+                "cc": self.cc_input.text(),
+                "subject": self.subject_input.text(),
+                "body": self.body_input.toPlainText()
+            }
+            with open(os.path.join(template_dir, f"{name}.json"), "w") as f:
+                json.dump(data, f)
+            self.load_templates()
+            QMessageBox.information(self, "Success", f"Template '{name}' saved!")
+
+    def load_template(self, index):
+        """Load a template into the form"""
+        import json
+        if index <= 0: return
+        template_name = self.template_combo.currentText()
+        template_path = os.path.join(os.getcwd(), "MailTemplates", f"{template_name}.json")
+        if os.path.exists(template_path):
+            with open(template_path, "r") as f:
+                data = json.load(f)
+            self.from_input.setText(data.get("from", ""))
+            self.to_input.setText(data.get("to", ""))
+            self.cc_input.setText(data.get("cc", ""))
+            self.subject_input.setText(data.get("subject", ""))
+            self.body_input.setPlainText(data.get("body", ""))
     
     def generate_draft(self):
         try:
@@ -2469,8 +2554,18 @@ class MailDrafterModule(QWidget):
             mail.To = self.to_input.text()
             mail.Subject = subject
             
-            if self.from_input.text().strip():
-                mail.SentOnBehalfOfName = self.from_input.text().strip()
+            # CC recipients
+            cc_text = self.cc_input.text().strip()
+            if cc_text:
+                mail.CC = cc_text
+            
+            # Send on Behalf requires the account to have permissions
+            from_addr = self.from_input.text().strip()
+            if from_addr:
+                try:
+                    mail.SentOnBehalfOfName = from_addr
+                except Exception as e:
+                    print(f"Could not set SentOnBehalfOfName: {e}")
             
             # Preserve signature by appending to body
             user_body = self.body_input.toPlainText().replace("\n", "<br>")
