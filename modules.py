@@ -10,7 +10,7 @@ from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
                                QTableWidgetItem, QLineEdit, QSpinBox, QComboBox,
                                QTextEdit, QListWidget, QDialog, QDialogButtonBox,
                                QMessageBox, QGraphicsScene, QGraphicsView,
-                               QGraphicsRectItem, QTabWidget, QMainWindow, QInputDialog,
+                               QGraphicsRectItem, QTabWidget, QMainWindow, QInputDialog,QApplication,
                                QRubberBand, QMenu)
 from PySide6.QtCore import Qt, QPointF, QRectF, Signal, QThread, QPoint, QRect, QSize
 from PySide6.QtGui import QPixmap, QImage, QPen, QColor, QBrush
@@ -1600,35 +1600,46 @@ class PDFEditorModule(QWidget):
 
     def rasterize_and_clean(self, tab):
         """Convert pages to images and redact bottom area"""
+        import traceback  # Move import to top of function to be safe
+        
         try:
-            # Get settings from user
+            # QInputDialog.getInt(parent, title, label, value, min, max, step)
             bottom_margin, ok = QInputDialog.getInt(self, "Redact Bottom", 
                 "Enter height (pixels) from bottom to remove (e.g. 50-100):", 
-                value=80, min=0, max=500)
+                80, 0, 500, 1)
             if not ok: return
             
             import uuid
-            QMessageBox.information(self, "Processing", "This may take a moment...")
+            
+            QMessageBox.information(self, "Processing", "This may take a moment. Large files might be slow.")
             QApplication.setOverrideCursor(Qt.WaitCursor)
             
             src_doc = tab.doc
             new_doc = fitz.open() # New empty PDF
             
-            for page in src_doc:
-                # 1. Render to high-quality image
-                # matrix=2 gives 2x resolution (suitable for print/readability)
-                pix = page.get_pixmap(matrix=fitz.Matrix(2.0, 2.0))
-                
-                # 2. Create new page matching image dimensions
-                new_page = new_doc.new_page(width=pix.width, height=pix.height)
-                
-                # 3. Insert the image
-                new_page.insert_image(new_page.rect, pixmap=pix)
-                
-                # 4. Redact the bottom area (Draw white rectangle)
-                if bottom_margin > 0:
-                    redact_rect = fitz.Rect(0, pix.height - bottom_margin, pix.width, pix.height)
-                    new_page.draw_rect(redact_rect, color=(1, 1, 1), fill=(1, 1, 1))
+            for i, page in enumerate(src_doc):
+                try:
+                    # 1. Render to high-quality image
+                    # Use JPEG compression to save memory/space
+                    pix = page.get_pixmap(matrix=fitz.Matrix(2.0, 2.0))
+                    
+                    # 2. Create new page matching image dimensions
+                    new_page = new_doc.new_page(width=pix.width, height=pix.height)
+                    
+                    # 3. Insert the image
+                    # Use tobytes("jpg") for compression - greatly reduces memory usage causing errors
+                    new_page.insert_image(new_page.rect, stream=pix.tobytes("jpg"), keep_proportion=True)
+                    
+                    # 4. Redact the bottom area (Draw white rectangle)
+                    if bottom_margin > 0:
+                        y0 = max(0, pix.height - bottom_margin)
+                        redact_rect = fitz.Rect(0, y0, pix.width, pix.height)
+                        new_page.draw_rect(redact_rect, color=(1, 1, 1), fill=(1, 1, 1))
+                    
+                    pix = None # Help GC
+                except Exception as inner_e:
+                    print(f"Error processing page {i+1}: {inner_e}")
+                    raise inner_e
             
             # Save new PDF
             new_filename = f"rasterized_{uuid.uuid4().hex[:8]}.pdf"
@@ -1642,7 +1653,11 @@ class PDFEditorModule(QWidget):
             
         except Exception as e:
             QApplication.restoreOverrideCursor()
-            QMessageBox.critical(self, "Error", f"Rasterization failed: {e}")
+            # Ensure traceback is available even if import failed inside try block
+            # (though we moved it up now)
+            error_msg = f"Rasterization failed: {e}\n{traceback.format_exc()}"
+            print(error_msg)
+            QMessageBox.critical(self, "Error", f"Rasterization failed. See console for details.\n{str(e)}")
 
     def open_pdf_file(self, path):
         """Helper to open a PDF file given a path"""
