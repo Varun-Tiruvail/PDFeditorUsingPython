@@ -1215,6 +1215,7 @@ class PDFEditorModule(QWidget):
             QMessageBox.critical(self, "Error", str(e))
 
     def redact_custom_location(self):
+        self.redact_mode = "standard"
         tab = self.current_tab()
         if not tab:
             QMessageBox.warning(self, "No PDF", "Please open a PDF first.")
@@ -1223,6 +1224,16 @@ class PDFEditorModule(QWidget):
         tab.label.set_selection_mode(True)
         tab.label.setCursor(Qt.CrossCursor)
         QMessageBox.information(self, "Custom Redaction", "Draw a box around the area you wish to redact.")
+
+    def prepare_rasterize_redaction(self):
+        """Start coordinate selection for rasterization redaction"""
+        self.redact_mode = "rasterize"
+        tab = self.current_tab()
+        if not tab: return
+        
+        tab.label.set_selection_mode(True)
+        tab.label.setCursor(Qt.CrossCursor)
+        QMessageBox.information(self, "Select Redaction Area", "Draw a box around the area (e.g. page number) to redact on ALL pages during rasterization.")
 
     def apply_custom_redaction(self, tab, ui_rect):
         tab.label.set_selection_mode(False)
@@ -1248,21 +1259,41 @@ class PDFEditorModule(QWidget):
             # PDF coordinates
             page = tab.doc.load_page(tab.current_page)
             pdf_w, pdf_h = page.rect.width, page.rect.height
+            scale = tab.scale
             
-            x0 = (ui_rect.left() - offset_x) / tab.scale
-            y0 = (ui_rect.top() - offset_y) / tab.scale
-            x1 = (ui_rect.right() - offset_x) / tab.scale
-            y1 = (ui_rect.bottom() - offset_y) / tab.scale
+            x0 = (ui_rect.left() - offset_x) / scale
+            y0 = (ui_rect.top() - offset_y) / scale
+            x1 = (ui_rect.right() - offset_x) / scale
+            y1 = (ui_rect.bottom() - offset_y) / scale
+            
+            # Validate bounds
+            x0 = max(0, min(x0, pdf_w))
+            y0 = max(0, min(y0, pdf_h))
+            x1 = max(0, min(x1, pdf_w))
+            y1 = max(0, min(y1, pdf_h))
             
             # Target rect on current page
             target_rect = fitz.Rect(x0, y0, x1, y1)
             
-            # Calculate offsets from bottom and right
+            # Calculate offsets from bottom and right (for relative positioning)
             dist_right = pdf_w - x1
             dist_bottom = pdf_h - y1
             rect_w = x1 - x0
             rect_h = y1 - y0
+            
+            # --- BRANCH BASED ON MODE ---
+            
+            if getattr(self, "redact_mode", "standard") == "rasterize":
+                # Rasterization Mode
+                reply = QMessageBox.question(self, "Confirm Rasterize & Redact", 
+                                           "This will convert all pages to images (fixing security/rotation) and redact the selected area on EVERY page.\n\nProceed?",
+                                           QMessageBox.Yes | QMessageBox.No)
+                if reply == QMessageBox.Yes:
+                    geometry = (rect_w, rect_h, dist_right, dist_bottom)
+                    self.rasterize_with_redaction(tab, geometry)
+                return
 
+            # Standard Mode (Existing Logic)
             reply = QMessageBox.question(self, "Confirm Redaction", 
                                        "Redact this area on all pages?",
                                        QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel)
@@ -1288,6 +1319,110 @@ class PDFEditorModule(QWidget):
             QMessageBox.information(self, "Success", "Redaction applied.")
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Redaction failed: {e}")
+
+    def show_advanced_menu(self):
+        tab = self.current_tab()
+        if not tab: return
+        
+        from PySide6.QtGui import QCursor
+        menu = QMenu(self)
+        
+        act_sanitize = menu.addAction("🔓 Sanitize & Unlock PDF")
+        act_sanitize.setToolTip("Remove passwords, encryption, and restriction flags.")
+        
+        act_rasterize = menu.addAction("🖼️ Rasterize & Redact Bottom (Draw Box)")
+        act_rasterize.setToolTip("Convert pages to images to fix orientation/font issues, then redact a selected area.")
+        
+        # Show menu at mouse cursor position
+        action = menu.exec(QCursor.pos())
+        
+        if action == act_sanitize:
+            self.sanitize_pdf(tab)
+        elif action == act_rasterize:
+            self.prepare_rasterize_redaction()
+
+    def rasterize_with_redaction(self, tab, geometry):
+        """Convert pages to images and redact using relative geometry
+        geometry: (width, height, dist_from_right, dist_from_bottom)
+        """
+        import traceback
+        import uuid
+        
+        rect_w, rect_h, dist_right, dist_bottom = geometry
+        
+        try:
+            QMessageBox.information(self, "Processing", "Rasterizing and redacting... ensure coordinates are correct.")
+            QApplication.setOverrideCursor(Qt.WaitCursor)
+            
+            src_doc = tab.doc
+            new_doc = fitz.open() # New empty PDF
+            
+            for i, page in enumerate(src_doc):
+                try:
+                    # Render image
+                    pix = page.get_pixmap(matrix=fitz.Matrix(2.0, 2.0))
+                    new_page = new_doc.new_page(width=pix.width, height=pix.height)
+                    new_page.insert_image(new_page.rect, stream=pix.tobytes("jpg"), keep_proportion=True)
+                    
+                    # Calculate redaction rect for THIS page dimensions
+                    p_w, p_h = float(pix.width), float(pix.height)
+                    
+                    # Note: pixmap dimensions might differ from PDF point dimensions if scaled?
+                    # fitz.Matrix(2.0) scales the output image by 2x.
+                    # new_page.rect is set to pix.width/height, so coordinate space matches pixels.
+                    # HOWEVER, the geometry passed in was from PDF point coordinates (unscaled).
+                    # We must scale the redaction geometry by 2.0 to match the high-res image page.
+                    
+                    scale_factor = 2.0
+                    r_w = rect_w * scale_factor
+                    r_h = rect_h * scale_factor
+                    d_r = dist_right * scale_factor
+                    d_b = dist_bottom * scale_factor
+                    
+                    x1 = p_w - d_r
+                    y1 = p_h - d_b
+                    x0 = x1 - r_w
+                    y0 = y1 - r_h
+                    
+                    redact_rect = fitz.Rect(x0, y0, x1, y1)
+                    new_page.draw_rect(redact_rect, color=(1, 1, 1), fill=(1, 1, 1))
+                    
+                    pix = None
+                except Exception as inner_e:
+                    print(f"Error processing page {i+1}: {inner_e}")
+                    raise inner_e
+            
+            # Save new PDF
+            new_filename = f"rasterized_redacted_{uuid.uuid4().hex[:8]}.pdf"
+            new_path = os.path.join(self.temp_dir, new_filename)
+            new_doc.save(new_path)
+            new_doc.close()
+            
+            QApplication.restoreOverrideCursor()
+            self.open_pdf_file(new_path)
+            QMessageBox.information(self, "Success", "Rasterization complete! output opened in new tab.")
+            
+        except Exception as e:
+            QApplication.restoreOverrideCursor()
+            error_msg = f"Rasterization failed: {e}\n{traceback.format_exc()}"
+            print(error_msg)
+            QMessageBox.critical(self, "Error", f"Rasterization failed: {e}")
+
+    def sanitize_pdf(self, tab):
+        """Remove security and saving as a clean copy"""
+        try:
+            import uuid
+            new_filename = f"sanitized_{uuid.uuid4().hex[:8]}.pdf"
+            new_path = os.path.join(self.temp_dir, new_filename)
+            
+            # Save without encryption
+            tab.doc.save(new_path, encryption=fitz.PDF_ENCRYPT_NONE)
+            
+            # Open the new file
+            self.open_pdf_file(new_path)
+            QMessageBox.information(self, "Success", "PDF sanitized and opened in new tab!")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Sanitization failed: {e}")
 
     def add_page_numbers(self):
         tab = self.current_tab()
@@ -1561,103 +1696,7 @@ class PDFEditorModule(QWidget):
         except Exception as e:
             QMessageBox.critical(self, "Error", str(e))
 
-    def show_advanced_menu(self):
-        tab = self.current_tab()
-        if not tab: return
-        
-        from PySide6.QtGui import QCursor
-        menu = QMenu(self)
-        
-        act_sanitize = menu.addAction("🔓 Sanitize & Unlock PDF")
-        act_sanitize.setToolTip("Remove passwords, encryption, and restriction flags.")
-        
-        act_rasterize = menu.addAction("🖼️ Rasterize & Redact Bottom")
-        act_rasterize.setToolTip("Convert pages to images to fix orientation/font issues and redact page numbers.")
-        
-        # Show menu at mouse cursor position
-        action = menu.exec(QCursor.pos())
-        
-        if action == act_sanitize:
-            self.sanitize_pdf(tab)
-        elif action == act_rasterize:
-            self.rasterize_and_clean(tab)
-            
-    def sanitize_pdf(self, tab):
-        """Remove security and saving as a clean copy"""
-        try:
-            import uuid
-            new_filename = f"sanitized_{uuid.uuid4().hex[:8]}.pdf"
-            new_path = os.path.join(self.temp_dir, new_filename)
-            
-            # Save without encryption
-            tab.doc.save(new_path, encryption=fitz.PDF_ENCRYPT_NONE)
-            
-            # Open the new file
-            self.open_pdf_file(new_path)
-            QMessageBox.information(self, "Success", "PDF sanitized and opened in new tab!")
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"Sanitization failed: {e}")
 
-    def rasterize_and_clean(self, tab):
-        """Convert pages to images and redact bottom area"""
-        import traceback  # Move import to top of function to be safe
-        
-        try:
-            # QInputDialog.getInt(parent, title, label, value, min, max, step)
-            bottom_margin, ok = QInputDialog.getInt(self, "Redact Bottom", 
-                "Enter height (pixels) from bottom to remove (e.g. 50-100):", 
-                80, 0, 500, 1)
-            if not ok: return
-            
-            import uuid
-            
-            QMessageBox.information(self, "Processing", "This may take a moment. Large files might be slow.")
-            QApplication.setOverrideCursor(Qt.WaitCursor)
-            
-            src_doc = tab.doc
-            new_doc = fitz.open() # New empty PDF
-            
-            for i, page in enumerate(src_doc):
-                try:
-                    # 1. Render to high-quality image
-                    # Use JPEG compression to save memory/space
-                    pix = page.get_pixmap(matrix=fitz.Matrix(2.0, 2.0))
-                    
-                    # 2. Create new page matching image dimensions
-                    new_page = new_doc.new_page(width=pix.width, height=pix.height)
-                    
-                    # 3. Insert the image
-                    # Use tobytes("jpg") for compression - greatly reduces memory usage causing errors
-                    new_page.insert_image(new_page.rect, stream=pix.tobytes("jpg"), keep_proportion=True)
-                    
-                    # 4. Redact the bottom area (Draw white rectangle)
-                    if bottom_margin > 0:
-                        y0 = max(0, pix.height - bottom_margin)
-                        redact_rect = fitz.Rect(0, y0, pix.width, pix.height)
-                        new_page.draw_rect(redact_rect, color=(1, 1, 1), fill=(1, 1, 1))
-                    
-                    pix = None # Help GC
-                except Exception as inner_e:
-                    print(f"Error processing page {i+1}: {inner_e}")
-                    raise inner_e
-            
-            # Save new PDF
-            new_filename = f"rasterized_{uuid.uuid4().hex[:8]}.pdf"
-            new_path = os.path.join(self.temp_dir, new_filename)
-            new_doc.save(new_path)
-            new_doc.close()
-            
-            QApplication.restoreOverrideCursor()
-            self.open_pdf_file(new_path)
-            QMessageBox.information(self, "Success", "PDF rasterized and cleaned! Opened in new tab.")
-            
-        except Exception as e:
-            QApplication.restoreOverrideCursor()
-            # Ensure traceback is available even if import failed inside try block
-            # (though we moved it up now)
-            error_msg = f"Rasterization failed: {e}\n{traceback.format_exc()}"
-            print(error_msg)
-            QMessageBox.critical(self, "Error", f"Rasterization failed. See console for details.\n{str(e)}")
 
     def open_pdf_file(self, path):
         """Helper to open a PDF file given a path"""
