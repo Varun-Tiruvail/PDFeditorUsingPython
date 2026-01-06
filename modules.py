@@ -11,7 +11,7 @@ from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
                                QTextEdit, QListWidget, QDialog, QDialogButtonBox,
                                QMessageBox, QGraphicsScene, QGraphicsView,
                                QGraphicsRectItem, QTabWidget, QMainWindow, QInputDialog,
-                               QRubberBand)
+                               QRubberBand, QMenu)
 from PySide6.QtCore import Qt, QPointF, QRectF, Signal, QThread, QPoint, QRect, QSize
 from PySide6.QtGui import QPixmap, QImage, QPen, QColor, QBrush
 from sqlalchemy import create_engine, Column, Integer, String, Float, ForeignKey, Boolean, DateTime
@@ -425,9 +425,10 @@ class PDFEditorModule(QWidget):
         self.btn_redact_custom = self.create_btn("🎯 Redact Custom", self.redact_custom_location)
         self.btn_pagenum = self.create_btn("🔢 Add Page #", self.add_page_numbers)
         self.btn_header = self.create_btn("📝 Header/Footer", self.add_header_footer)
+        self.btn_advanced = self.create_btn("🔧 Advanced Tools", self.show_advanced_menu)
         
         for btn in [self.btn_open, self.btn_save, self.btn_close_all, self.btn_ppt, self.btn_compress, self.btn_merge, self.btn_split, 
-                   self.btn_redact, self.btn_redact_custom, self.btn_pagenum, self.btn_header]:
+                   self.btn_redact, self.btn_redact_custom, self.btn_pagenum, self.btn_header, self.btn_advanced]:
             toolbar.addWidget(btn)
         toolbar.addStretch()
         layout.addLayout(toolbar)
@@ -1559,6 +1560,118 @@ class PDFEditorModule(QWidget):
             QMessageBox.information(self, "Success", f"Removed {removed_count} header/footer items!")
         except Exception as e:
             QMessageBox.critical(self, "Error", str(e))
+
+    def show_advanced_menu(self):
+        tab = self.current_tab()
+        if not tab: return
+        
+        from PySide6.QtGui import QCursor
+        menu = QMenu(self)
+        
+        act_sanitize = menu.addAction("🔓 Sanitize & Unlock PDF")
+        act_sanitize.setToolTip("Remove passwords, encryption, and restriction flags.")
+        
+        act_rasterize = menu.addAction("🖼️ Rasterize & Redact Bottom")
+        act_rasterize.setToolTip("Convert pages to images to fix orientation/font issues and redact page numbers.")
+        
+        # Show menu at mouse cursor position
+        action = menu.exec(QCursor.pos())
+        
+        if action == act_sanitize:
+            self.sanitize_pdf(tab)
+        elif action == act_rasterize:
+            self.rasterize_and_clean(tab)
+            
+    def sanitize_pdf(self, tab):
+        """Remove security and saving as a clean copy"""
+        try:
+            import uuid
+            new_filename = f"sanitized_{uuid.uuid4().hex[:8]}.pdf"
+            new_path = os.path.join(self.temp_dir, new_filename)
+            
+            # Save without encryption
+            tab.doc.save(new_path, encryption=fitz.PDF_ENCRYPT_NONE)
+            
+            # Open the new file
+            self.open_pdf_file(new_path)
+            QMessageBox.information(self, "Success", "PDF sanitized and opened in new tab!")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Sanitization failed: {e}")
+
+    def rasterize_and_clean(self, tab):
+        """Convert pages to images and redact bottom area"""
+        try:
+            # Get settings from user
+            bottom_margin, ok = QInputDialog.getInt(self, "Redact Bottom", 
+                "Enter height (pixels) from bottom to remove (e.g. 50-100):", 
+                value=80, min=0, max=500)
+            if not ok: return
+            
+            import uuid
+            QMessageBox.information(self, "Processing", "This may take a moment...")
+            QApplication.setOverrideCursor(Qt.WaitCursor)
+            
+            src_doc = tab.doc
+            new_doc = fitz.open() # New empty PDF
+            
+            for page in src_doc:
+                # 1. Render to high-quality image
+                # matrix=2 gives 2x resolution (suitable for print/readability)
+                pix = page.get_pixmap(matrix=fitz.Matrix(2.0, 2.0))
+                
+                # 2. Create new page matching image dimensions
+                new_page = new_doc.new_page(width=pix.width, height=pix.height)
+                
+                # 3. Insert the image
+                new_page.insert_image(new_page.rect, pixmap=pix)
+                
+                # 4. Redact the bottom area (Draw white rectangle)
+                if bottom_margin > 0:
+                    redact_rect = fitz.Rect(0, pix.height - bottom_margin, pix.width, pix.height)
+                    new_page.draw_rect(redact_rect, color=(1, 1, 1), fill=(1, 1, 1))
+            
+            # Save new PDF
+            new_filename = f"rasterized_{uuid.uuid4().hex[:8]}.pdf"
+            new_path = os.path.join(self.temp_dir, new_filename)
+            new_doc.save(new_path)
+            new_doc.close()
+            
+            QApplication.restoreOverrideCursor()
+            self.open_pdf_file(new_path)
+            QMessageBox.information(self, "Success", "PDF rasterized and cleaned! Opened in new tab.")
+            
+        except Exception as e:
+            QApplication.restoreOverrideCursor()
+            QMessageBox.critical(self, "Error", f"Rasterization failed: {e}")
+
+    def open_pdf_file(self, path):
+        """Helper to open a PDF file given a path"""
+        try:
+            doc = fitz.open(path)
+            # Check if likely a temp file
+            is_temp = ".temp_pdfs" in path
+            tab = PDFTab(doc, path, is_temp=is_temp, temp_path=path if is_temp else None)
+            
+            from PySide6.QtWidgets import QDockWidget
+            dock = QDockWidget(os.path.basename(path), self)
+            dock.setWidget(tab)
+            dock.setAllowedAreas(Qt.AllDockWidgetAreas)
+            dock.setFeatures(QDockWidget.DockWidgetMovable | QDockWidget.DockWidgetFloatable | QDockWidget.DockWidgetClosable)
+            
+            tab.parent_dock = dock
+            dock.setContextMenuPolicy(Qt.CustomContextMenu)
+            dock.customContextMenuRequested.connect(lambda pos, d=dock: self.dock_context_menu(pos, d))
+            dock.visibilityChanged.connect(self.on_dock_visibility_changed)
+            
+            self.dock_manager.addDockWidget(Qt.RightDockWidgetArea, dock)
+            if self.docks:
+                self.dock_manager.tabifyDockWidget(self.docks[-1], dock)
+            self.docks.append(dock)
+            dock.show()
+            if len(self.docks) == 1: self._last_active_tab = tab
+            
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to open file: {e}")
 
 # ============================================================================
 # OCR TRAINER MODULE
