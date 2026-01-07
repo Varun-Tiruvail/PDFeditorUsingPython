@@ -1415,12 +1415,44 @@ class PDFEditorModule(QWidget):
             new_filename = f"sanitized_{uuid.uuid4().hex[:8]}.pdf"
             new_path = os.path.join(self.temp_dir, new_filename)
             
-            # Save without encryption
+            # Save without encryption first
             tab.doc.save(new_path, encryption=fitz.PDF_ENCRYPT_NONE)
             
+            # Open source for baking
+            src_doc = fitz.open(new_path)
+            out_doc = fitz.open()
+            
+            # Iterate and bake rotation
+            for page in src_doc:
+                rot = page.rotation
+                # If rotation is 90 or 270, swap dimensions for the new container
+                if rot in [90, 270]:
+                    new_page = out_doc.new_page(width=page.rect.height, height=page.rect.width)
+                else:
+                    new_page = out_doc.new_page(width=page.rect.width, height=page.rect.height)
+                
+                # Draw the page with its rotation baked in
+                # We need to apply the INVERSE rotation to bake it "upright" relative to the new canvas
+                # Empirical test: If src.rotation=90, we need rotate=-90 (or 270) to make it look upright.
+                new_page.show_pdf_page(new_page.rect, src_doc, page.number, rotate=-rot)
+            
+            # Save final baked PDF to a NEW path to avoid Windows file locking issues
+            final_path = new_path.replace(".pdf", "_baked.pdf")
+            out_doc.save(final_path)
+            out_doc.close()
+            
+            # Close source
+            src_doc.close()
+            
+            # Try to cleanup intermediate file (soft fail)
+            try:
+                os.remove(new_path)
+            except:
+                pass # If locked, let OS/cleanup handle it later
+            
             # Open the new file
-            self.open_pdf_file(new_path)
-            QMessageBox.information(self, "Success", "PDF sanitized and opened in new tab!")
+            self.open_pdf_file(final_path)
+            QMessageBox.information(self, "Success", "PDF sanitized (rotation baked) and opened in new tab!")
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Sanitization failed: {e}")
 
