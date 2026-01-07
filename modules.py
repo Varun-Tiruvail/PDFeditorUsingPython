@@ -1425,16 +1425,21 @@ class PDFEditorModule(QWidget):
             # Iterate and bake rotation
             for page in src_doc:
                 rot = page.rotation
-                # If rotation is 90 or 270, swap dimensions for the new container
-                if rot in [90, 270]:
-                    new_page = out_doc.new_page(width=page.rect.height, height=page.rect.width)
-                else:
-                    new_page = out_doc.new_page(width=page.rect.width, height=page.rect.height)
+                
+                # Create new page with VISUAL dimensions (page.rect reflects rotation already)
+                # If page is rotated 90, page.rect is already swapped (e.g. 842x595).
+                # So we just transform the visual rect to the new page.
+                new_page = out_doc.new_page(width=page.rect.width, height=page.rect.height)
+                
+                # Sync MediaBox to CropBox to prevent zoom-out/scaling issues naturally
+                # [FIX]: Normalize the origin to (0,0) so that show_pdf_page doesn't translate (shift) the content.
+                page.set_mediabox(page.cropbox)
                 
                 # Draw the page with its rotation baked in
-                # We need to apply the INVERSE rotation to bake it "upright" relative to the new canvas
-                # Empirical test: If src.rotation=90, we need rotate=-90 (or 270) to make it look upright.
-                new_page.show_pdf_page(new_page.rect, src_doc, page.number, rotate=-rot)
+                # We use 'rotate=rot' (positive) to preserve the VISUAL orientation.
+                # If page is Rot 90 (Visual Landscape, Top is Right), we want result to be Landscape, Top on Right.
+                # rotate=90 achieves this mapping.
+                new_page.show_pdf_page(new_page.rect, src_doc, page.number, rotate=rot, clip=page.cropbox)
             
             # Save final baked PDF to a NEW path to avoid Windows file locking issues
             final_path = new_path.replace(".pdf", "_baked.pdf")
