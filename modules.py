@@ -13,7 +13,7 @@ from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
                                QGraphicsRectItem, QTabWidget, QMainWindow, QInputDialog,QApplication,
                                QRubberBand, QMenu)
 from PySide6.QtCore import Qt, QPointF, QRectF, Signal, QThread, QPoint, QRect, QSize
-from PySide6.QtGui import QPixmap, QImage, QPen, QColor, QBrush
+from PySide6.QtGui import QPixmap, QImage, QPen, QColor, QBrush, QPainter
 from sqlalchemy import create_engine, Column, Integer, String, Float, ForeignKey, Boolean, DateTime
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship
@@ -126,36 +126,170 @@ Base.metadata.create_all(engine)
 # ============================================================================
 
 class PDFCanvas(QLabel):
-    """Custom label that supports drawing a selection rectangle"""
-    selection_completed = Signal(QRect)
+    """Custom label that supports interactive selection with resize handles"""
+    selection_confirmed = Signal(QRect)
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.rubber_band = QRubberBand(QRubberBand.Rectangle, self)
-        self.origin = QPoint()
+        self.setMouseTracking(True)  # Improve responsiveness
         self.selection_mode = False
+        
+        # State
+        self.current_rect = QRect()
+        self.drag_start = QPoint()
+        self.drag_mode = None  # None, 'create', 'move', 'handle'
+        self.active_handle = None
+        
+        # Appearance
+        self.handle_size = 8
+        self.border_color = QColor(255, 0, 0)
+        self.fill_color = QColor(255, 0, 0, 50)
+        self.handle_color = QColor(255, 255, 255)
 
     def set_selection_mode(self, enabled):
         self.selection_mode = enabled
-        if not enabled:
-            self.rubber_band.hide()
+        if enabled:
+            self.setCursor(Qt.CrossCursor)
+            self.setFocus()
+        else:
+            self.setCursor(Qt.ArrowCursor)
+            self.current_rect = QRect() # Clear selection
+            self.update()
+
+    def paintEvent(self, event):
+        super().paintEvent(event) # Draw the pixmap
+        
+        if self.selection_mode and not self.current_rect.isNull():
+            painter = QPainter(self)
+            painter.setPen(QPen(self.border_color, 2))
+            painter.setBrush(QBrush(self.fill_color))
+            
+            # Draw Main Rect
+            painter.drawRect(self.current_rect)
+            
+            # Draw Handles
+            painter.setBrush(QBrush(self.handle_color))
+            painter.setPen(QPen(self.border_color, 1))
+            for handle_rect in self._get_handles().values():
+                painter.drawRect(handle_rect)
+
+    def _get_handles(self):
+        """Calculate handle rectangles for current selection"""
+        if self.current_rect.isNull(): return {}
+        
+        r = self.current_rect
+        s = self.handle_size
+        hs = s // 2
+        
+        handles = {
+            'tl': QRect(r.left() - hs, r.top() - hs, s, s),
+            't':  QRect(r.center().x() - hs, r.top() - hs, s, s),
+            'tr': QRect(r.right() - hs, r.top() - hs, s, s),
+            'r':  QRect(r.right() - hs, r.center().y() - hs, s, s),
+            'br': QRect(r.right() - hs, r.bottom() - hs, s, s),
+            'b':  QRect(r.center().x() - hs, r.bottom() - hs, s, s),
+            'bl': QRect(r.left() - hs, r.bottom() - hs, s, s),
+            'l':  QRect(r.left() - hs, r.center().y() - hs, s, s),
+        }
+        return handles
+
+    def _get_handle_at(self, pos):
+        for name, rect in self._get_handles().items():
+            if rect.contains(pos):
+                return name
+        return None
 
     def mousePressEvent(self, event):
-        if self.selection_mode and event.button() == Qt.LeftButton:
-            self.origin = event.position().toPoint()
-            self.rubber_band.setGeometry(QRect(self.origin, QSize()))
-            self.rubber_band.show()
+        if not self.selection_mode or event.button() != Qt.LeftButton:
+            return
+            
+        pos = event.position().toPoint()
+        
+        # Check handles first
+        handle = self._get_handle_at(pos)
+        if handle:
+            self.drag_mode = 'handle'
+            self.active_handle = handle
+            self.drag_start = pos
+            return
+            
+        # Check move
+        if self.current_rect.contains(pos):
+            self.drag_mode = 'move'
+            self.drag_start = pos
+            self.setCursor(Qt.SizeAllCursor)
+            return
+            
+        # Create new
+        self.drag_mode = 'create'
+        self.drag_start = pos
+        self.current_rect = QRect(pos, QSize())
+        self.update()
 
     def mouseMoveEvent(self, event):
-        if self.selection_mode and not self.origin.isNull():
-            self.rubber_band.setGeometry(QRect(self.origin, event.position().toPoint()).normalized())
+        if not self.selection_mode: return
+
+        pos = event.position().toPoint()
+        
+        # Update cursor hover feedback
+        if not self.drag_mode:
+            handle = self._get_handle_at(pos)
+            if handle:
+                if handle in ['tl', 'br']: self.setCursor(Qt.SizeFDiagCursor)
+                elif handle in ['tr', 'bl']: self.setCursor(Qt.SizeBDiagCursor)
+                elif handle in ['l', 'r']: self.setCursor(Qt.SizeHorCursor)
+                elif handle in ['t', 'b']: self.setCursor(Qt.SizeVerCursor)
+            elif self.current_rect.contains(pos):
+                self.setCursor(Qt.SizeAllCursor)
+            else:
+                self.setCursor(Qt.CrossCursor)
+            return
+
+        # Handle Dragging
+        dx = pos.x() - self.drag_start.x()
+        dy = pos.y() - self.drag_start.y()
+        
+        if self.drag_mode == 'create':
+            self.current_rect = QRect(self.drag_start, pos).normalized()
+            
+        elif self.drag_mode == 'move':
+            self.current_rect.translate(dx, dy)
+            self.drag_start = pos
+            
+        elif self.drag_mode == 'handle':
+            r = self.current_rect
+            # Adjust specific edges based on handle
+            if 'l' in self.active_handle: r.setLeft(r.left() + dx)
+            if 'r' in self.active_handle: r.setRight(r.right() + dx)
+            if 't' in self.active_handle: r.setTop(r.top() + dy)
+            if 'b' in self.active_handle: r.setBottom(r.bottom() + dy)
+            self.current_rect = r.normalized()
+            self.drag_start = pos
+            
+        self.update()
 
     def mouseReleaseEvent(self, event):
         if self.selection_mode and event.button() == Qt.LeftButton:
-            rect = self.rubber_band.geometry()
-            self.rubber_band.hide()
-            self.origin = QPoint()
-            self.selection_completed.emit(rect)
+            self.drag_mode = None
+            self.active_handle = None
+            self.update() # Refreshes handles position
+            
+            # Ensure 0-size rects are ignored but don't finish yet
+            if self.current_rect.width()<5 and self.current_rect.height()<5:
+                self.current_rect = QRect()
+                
+    def keyPressEvent(self, event):
+        if not self.selection_mode:
+            super().keyPressEvent(event)
+            return
+            
+        if event.key() in (Qt.Key_Return, Qt.Key_Enter):
+            if not self.current_rect.isNull():
+                self.selection_confirmed.emit(self.current_rect)
+        elif event.key() == Qt.Key_Escape:
+            self.current_rect = QRect()
+            self.update()
+            # Optionally exit mode? For now just clear selection
 
 # ============================================================================
 # PDF EDITOR MODULE
@@ -272,21 +406,14 @@ class PDFTab(QWidget):
         self.scroll = QScrollArea()
         self.label = PDFCanvas()
         self.label.setAlignment(Qt.AlignCenter)
-        self.label.selection_completed.connect(self.handle_selection)
+
         self.scroll.setWidget(self.label)
         self.scroll.setWidgetResizable(True)
         layout.addWidget(self.scroll)
         
         self.render()
 
-    def handle_selection(self, rect):
-        """Handle redaction selection from canvas"""
-        # Find parent PDFEditorModule
-        parent = self.parent()
-        while parent and not isinstance(parent, PDFEditorModule):
-            parent = parent.parent()
-        if parent:
-            parent.apply_custom_redaction(self, rect)
+
     
     def zoom_in(self):
         self.scale *= 1.2
@@ -595,6 +722,9 @@ class PDFEditorModule(QWidget):
                 
                 # Signal for active tab tracking
                 dock.visibilityChanged.connect(self.on_dock_visibility_changed)
+
+                # Connect interactive selection signal
+                tab.label.selection_confirmed.connect(lambda rect: self.apply_custom_redaction(tab, rect))
                 
                 self.dock_manager.addDockWidget(Qt.RightDockWidgetArea, dock)
                 if self.docks:
@@ -1247,8 +1377,12 @@ class PDFEditorModule(QWidget):
             return
 
         try:
-            # Map UI coordinates to PDF coordinates
-            # ui_rect is relative to the QLabel (which might be larger than pixmap due to centering)
+            # 1. Get Source Page Info
+            # Note: pixmap dimensions match the VISUAL size of the page (after rotation) * scale
+            p_width = pixmap.width()
+            p_height = pixmap.height()
+            
+            # Map UI coordinates to Pixmap coordinates
             pixmap_rect = pixmap.rect()
             label_rect = tab.label.rect()
             
@@ -1256,70 +1390,148 @@ class PDFEditorModule(QWidget):
             offset_x = (label_rect.width() - pixmap_rect.width()) / 2
             offset_y = (label_rect.height() - pixmap_rect.height()) / 2
             
-            # PDF coordinates
-            page = tab.doc.load_page(tab.current_page)
-            pdf_w, pdf_h = page.rect.width, page.rect.height
-            scale = tab.scale
+            # Get Selection coordinates relative to the Pixmap (Visual Page)
+            vis_x0 = (ui_rect.left() - offset_x)
+            vis_y0 = (ui_rect.top() - offset_y)
+            vis_x1 = (ui_rect.right() - offset_x)
+            vis_y1 = (ui_rect.bottom() - offset_y)
             
-            x0 = (ui_rect.left() - offset_x) / scale
-            y0 = (ui_rect.top() - offset_y) / scale
-            x1 = (ui_rect.right() - offset_x) / scale
-            y1 = (ui_rect.bottom() - offset_y) / scale
+            # Normalize these (0.0 to 1.0) relative to visual page size
+            # This makes us independent of zoom (scale) AND independent of absolute page size (if we want relative placement)
+            n_x0 = vis_x0 / p_width
+            n_y0 = vis_y0 / p_height
+            n_x1 = vis_x1 / p_width
+            n_y1 = vis_y1 / p_height
             
-            # Validate bounds
-            x0 = max(0, min(x0, pdf_w))
-            y0 = max(0, min(y0, pdf_h))
-            x1 = max(0, min(x1, pdf_w))
-            y1 = max(0, min(y1, pdf_h))
-            
-            # Target rect on current page
-            target_rect = fitz.Rect(x0, y0, x1, y1)
-            
-            # Calculate offsets from bottom and right (for relative positioning)
-            dist_right = pdf_w - x1
-            dist_bottom = pdf_h - y1
-            rect_w = x1 - x0
-            rect_h = y1 - y0
-            
+            # Clamp
+            n_x0 = max(0.0, min(n_x0, 1.0))
+            n_y0 = max(0.0, min(n_y0, 1.0))
+            n_x1 = max(0.0, min(n_x1, 1.0))
+            n_y1 = max(0.0, min(n_y1, 1.0))
+
             # --- BRANCH BASED ON MODE ---
-            
             if getattr(self, "redact_mode", "standard") == "rasterize":
-                # Rasterization Mode
+                # For rasterization, we just need to pass the normalized rect or handle it there.
+                # Currently rasterize expects exact geometry relative to Bottom/Right.
+                # Let's calculate geometry for the current page and pass it.
+                # Rasterization will assume all pages become images of this visual orientation.
+                # We need to de-normalize for the underlying PDF logic if we use it there, 
+                # but rasterizer creates new pages.
+                
+                # Let's calc visual rect in PDF points (unscaled) for current page
+                page = tab.doc.load_page(tab.current_page)
+                # Visual dimensions in points:
+                if page.rotation in (0, 180):
+                    vis_w_pts, vis_h_pts = page.rect.width, page.rect.height
+                else:
+                    vis_w_pts, vis_h_pts = page.rect.height, page.rect.width
+                
+                rect_w = (n_x1 - n_x0) * vis_w_pts
+                rect_h = (n_y1 - n_y0) * vis_h_pts
+                dist_right = vis_w_pts - (n_x1 * vis_w_pts)
+                dist_bottom = vis_h_pts - (n_y1 * vis_h_pts)
+                
                 reply = QMessageBox.question(self, "Confirm Rasterize & Redact", 
-                                           "This will convert all pages to images (fixing security/rotation) and redact the selected area on EVERY page.\n\nProceed?",
+                                           "This will convert all pages to images and redact this area.\n\nProceed?",
                                            QMessageBox.Yes | QMessageBox.No)
                 if reply == QMessageBox.Yes:
                     geometry = (rect_w, rect_h, dist_right, dist_bottom)
                     self.rasterize_with_redaction(tab, geometry)
                 return
 
-            # Standard Mode (Existing Logic)
+            # Standard Mode
             reply = QMessageBox.question(self, "Confirm Redaction", 
                                        "Redact this area on all pages?",
                                        QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel)
             
             if reply == QMessageBox.Cancel: return
             
-            if reply == QMessageBox.Yes:
-                for pg in tab.doc:
-                    # Calculate position on this specific page based on bottom-right distance
-                    p_w, p_h = pg.rect.width, pg.rect.height
-                    pg_x1 = p_w - dist_right
-                    pg_y1 = p_h - dist_bottom
-                    pg_x0 = pg_x1 - rect_w
-                    pg_y0 = pg_y1 - rect_h
+            pages_to_process = range(len(tab.doc)) if reply == QMessageBox.Yes else [tab.current_page]
+            
+            for pg_idx in pages_to_process:
+                pg = tab.doc.load_page(pg_idx)
+                rot = pg.rotation
+                
+                # 1. Determine Visual Dimensions of this page in Points
+                # Internal (Unrotated) Dimensions
+                w_int = pg.rect.width
+                h_int = pg.rect.height
+                
+                if rot in (90, 270):
+                    w_vis = h_int
+                    h_vis = w_int
+                else:
+                    w_vis = w_int
+                    h_vis = h_int
+                
+                # 2. Map Normalized Coordinates to Visual Points for this page
+                # This ensures "Relative Visual Position" is preserved
+                vx0 = n_x0 * w_vis
+                vy0 = n_y0 * h_vis
+                vx1 = n_x1 * w_vis
+                vy1 = n_y1 * h_vis
+                
+                # 3. Transform Visual Rect (vx0, vy0, vx1, vy1) to Internal Rect (ix0, iy0, ix1, iy1)
+                # Apply Inverse Rotation Logic
+                
+                if rot == 0:
+                    rect = fitz.Rect(vx0, vy0, vx1, vy1)
                     
-                    pg.add_redact_annot(fitz.Rect(pg_x0, pg_y0, pg_x1, pg_y1), fill=(1, 1, 1))
-                    pg.apply_redactions()
-            else:
-                page.add_redact_annot(target_rect, fill=(1, 1, 1))
-                page.apply_redactions()
+                elif rot == 90:
+                    # Vis x -> Int y (start from top?)
+                    # x_int = y_vis
+                    # y_int = w_vis - x_vis - (width of rect? no, x_vis is right edge?)
+                    # Let's map corners:
+                    # TL_vis (vx0, vy0) -> (vy0, w_vis - vx0) ? No.
+                    # 90 deg CW: Top Edge -> Right Edge.
+                    # Vis (x, 0) -> Int (H_int, x) ?? No.
+                    # Let's use the verified logic:
+                    # x_int = y_vis
+                    # y_int = h_int - x_vis  (Note: h_int == w_vis)
+                    
+                    # We have a Rect defined by 2 points. We must map both points (TL and BR) 
+                    # Use points to avoid confusion with min/max
+                    p1 = (vx0, vy0)
+                    p2 = (vx1, vy1)
+                    
+                    # Transform Function for 90 deg (Counter-Clockwise relative to content? No page rotation is CW)
+                    # Content at (x,y) appears at rot(x,y).
+                    # We perceive (vx, vy). We want (ix, iy).
+                    # ix = vy
+                    # iy = w_vis - vx (which is h_int - vx)
+                    
+                    ix0, iy0 = vy0, w_vis - vx0
+                    ix1, iy1 = vy1, w_vis - vx1
+                    rect = fitz.Rect(ix0, iy0, ix1, iy1).normalize()
+                    
+                elif rot == 180:
+                    # ix = w_vis - vx  (w_vis == w_int)
+                    # iy = h_vis - vy  (h_vis == h_int)
+                    ix0, iy0 = w_vis - vx0, h_vis - vy0
+                    ix1, iy1 = w_vis - vx1, h_vis - vy1
+                    rect = fitz.Rect(ix0, iy0, ix1, iy1).normalize()
+                    
+                elif rot == 270:
+                    # 270 CW. Top Edge -> Left Edge.
+                    # Vis (0, y) -> Int (y, 0) ? No.
+                    # Logic:
+                    # ix = h_vis - vy  (h_vis == w_int)
+                    # iy = vx
+                    ix0, iy0 = h_vis - vy0, vx0
+                    ix1, iy1 = h_vis - vy1, vx1
+                    rect = fitz.Rect(ix0, iy0, ix1, iy1).normalize()
+                
+                else:
+                    # Fallback for odd rotations
+                    rect = fitz.Rect(vx0, vy0, vx1, vy1)
+
+                pg.add_redact_annot(rect, fill=(1, 1, 1))
+                pg.apply_redactions()
             
             tab.render()
             QMessageBox.information(self, "Success", "Redaction applied.")
         except Exception as e:
-            QMessageBox.critical(self, "Error", f"Redaction failed: {e}")
-
+            QMessageBox.critical(self, "Error", str(e))
     def show_advanced_menu(self):
         tab = self.current_tab()
         if not tab: return
@@ -1753,6 +1965,9 @@ class PDFEditorModule(QWidget):
             dock.setContextMenuPolicy(Qt.CustomContextMenu)
             dock.customContextMenuRequested.connect(lambda pos, d=dock: self.dock_context_menu(pos, d))
             dock.visibilityChanged.connect(self.on_dock_visibility_changed)
+            
+            # Connect interactive selection signal
+            tab.label.selection_confirmed.connect(lambda rect: self.apply_custom_redaction(tab, rect))
             
             self.dock_manager.addDockWidget(Qt.RightDockWidgetArea, dock)
             if self.docks:
