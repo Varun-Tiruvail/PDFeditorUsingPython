@@ -548,14 +548,13 @@ class PDFEditorModule(QWidget):
         self.btn_compress = self.create_btn("🗜️ Compress", self.compress_pdf)
         self.btn_merge = self.create_btn("📑 Merge", self.merge_pdfs)
         self.btn_split = self.create_btn("✂️ Split", self.split_pdf)
-        self.btn_redact = self.create_btn("🚫 Redact Auto", self.redact_page_numbers)
         self.btn_redact_custom = self.create_btn("🎯 Redact Custom", self.redact_custom_location)
         self.btn_pagenum = self.create_btn("🔢 Add Page #", self.add_page_numbers)
         self.btn_header = self.create_btn("📝 Header/Footer", self.add_header_footer)
         self.btn_advanced = self.create_btn("🔧 Advanced Tools", self.show_advanced_menu)
         
         for btn in [self.btn_open, self.btn_save, self.btn_close_all, self.btn_ppt, self.btn_compress, self.btn_merge, self.btn_split, 
-                   self.btn_redact, self.btn_redact_custom, self.btn_pagenum, self.btn_header, self.btn_advanced]:
+                   self.btn_redact_custom, self.btn_pagenum, self.btn_header, self.btn_advanced]:
             toolbar.addWidget(btn)
         toolbar.addStretch()
         layout.addLayout(toolbar)
@@ -1296,64 +1295,27 @@ class PDFEditorModule(QWidget):
             except Exception as e:
                 QMessageBox.critical(self, "Error", str(e))
 
-    def redact_page_numbers(self):
-        tab = self.current_tab()
-        if not tab: return
-        
-        try:
-            doc = tab.doc
-            count = 0
-            # Enhanced patterns to catch more page number formats including semi-bold
-            patterns = [
-                r"^\d+$",                          # Just number: 1, 2, 3
-                r"^Page\s*\d+$",                   # Page 1, Page1
-                r"^\d+\s*of\s*\d+$",               # 1 of 10
-                r"^Page\s*\d+\s*of\s*\d+$",        # Page 1 of 10
-                r"^-\s*\d+\s*-$",                  # - 1 -
-                r"^\[\d+\]$",                      # [1]
-                r"^\(\d+\)$",                      # (1)
-                r"^p\.?\s*\d+$",                   # p.1, p 1
-            ]
-            
-            for page in doc:
-                rect = page.rect
-                w, h = rect.width, rect.height
-                
-                # Define regions: Bottom Center (middle 33%) and Bottom Right (right 33%)
-                # Bottom 10% height
-                regions = [
-                    fitz.Rect(w * 0.33, h * 0.9, w * 0.66, h), # Bottom Center
-                    fitz.Rect(w * 0.66, h * 0.9, w, h)         # Bottom Right
-                ]
-                
-                for region in regions:
-                    blocks = page.get_text("dict", clip=region)["blocks"]
-                    for b in blocks:
-                        for l in b["lines"]:
-                            for s in l["spans"]:
-                                text = s["text"].strip()
-                                for pat in patterns:
-                                    if re.match(pat, text, re.IGNORECASE):
-                                        page.add_redact_annot(fitz.Rect(s["bbox"]), fill=(1, 1, 1))
-                                        count += 1
-                                        break
-                page.apply_redactions()
-            
-            tab.render() # Refresh view
-            QMessageBox.information(self, "Success", f"Redacted {count} locations in Bottom Center/Right.")
-        except Exception as e:
-            QMessageBox.critical(self, "Error", str(e))
-
     def redact_custom_location(self):
+        """Custom redaction - works with rotated pages via coordinate transformation"""
         self.redact_mode = "standard"
         tab = self.current_tab()
         if not tab:
             QMessageBox.warning(self, "No PDF", "Please open a PDF first.")
             return
         
+        # Check if any page has rotation and inform user
+        has_rotation = any(page.rotation != 0 for page in tab.doc)
+        if has_rotation:
+            QMessageBox.information(
+                self, "Note",
+                "Some pages have rotation. Redaction coordinates will be automatically transformed to match the visual position."
+            )
+        
+        # Enable selection mode for redaction
         tab.label.set_selection_mode(True)
         tab.label.setCursor(Qt.CrossCursor)
-        QMessageBox.information(self, "Custom Redaction", "Draw a box around the area you wish to redact.")
+        QMessageBox.information(self, "Custom Redaction", "Draw a box around the area you wish to redact. A preview will be shown before applying.")
+
 
     def prepare_rasterize_redaction(self):
         """Start coordinate selection for rasterization redaction"""
@@ -1366,6 +1328,7 @@ class PDFEditorModule(QWidget):
         QMessageBox.information(self, "Select Redaction Area", "Draw a box around the area (e.g. page number) to redact on ALL pages during rasterization.")
 
     def apply_custom_redaction(self, tab, ui_rect):
+        """Apply redaction with preview/confirm/undo flow"""
         tab.label.set_selection_mode(False)
         tab.label.setCursor(Qt.ArrowCursor)
         
@@ -1377,12 +1340,10 @@ class PDFEditorModule(QWidget):
             return
 
         try:
-            # 1. Get Source Page Info
-            # Note: pixmap dimensions match the VISUAL size of the page (after rotation) * scale
+            # 1. Calculate normalized coordinates (0.0 to 1.0)
             p_width = pixmap.width()
             p_height = pixmap.height()
             
-            # Map UI coordinates to Pixmap coordinates
             pixmap_rect = pixmap.rect()
             label_rect = tab.label.rect()
             
@@ -1390,41 +1351,23 @@ class PDFEditorModule(QWidget):
             offset_x = (label_rect.width() - pixmap_rect.width()) / 2
             offset_y = (label_rect.height() - pixmap_rect.height()) / 2
             
-            # Get Selection coordinates relative to the Pixmap (Visual Page)
+            # Get Selection coordinates relative to the Pixmap
             vis_x0 = (ui_rect.left() - offset_x)
             vis_y0 = (ui_rect.top() - offset_y)
             vis_x1 = (ui_rect.right() - offset_x)
             vis_y1 = (ui_rect.bottom() - offset_y)
             
-            # Normalize these (0.0 to 1.0) relative to visual page size
-            # This makes us independent of zoom (scale) AND independent of absolute page size (if we want relative placement)
-            n_x0 = vis_x0 / p_width
-            n_y0 = vis_y0 / p_height
-            n_x1 = vis_x1 / p_width
-            n_y1 = vis_y1 / p_height
-            
-            # Clamp
-            n_x0 = max(0.0, min(n_x0, 1.0))
-            n_y0 = max(0.0, min(n_y0, 1.0))
-            n_x1 = max(0.0, min(n_x1, 1.0))
-            n_y1 = max(0.0, min(n_y1, 1.0))
+            # Normalize coordinates (0.0 to 1.0)
+            n_x0 = max(0.0, min(vis_x0 / p_width, 1.0))
+            n_y0 = max(0.0, min(vis_y0 / p_height, 1.0))
+            n_x1 = max(0.0, min(vis_x1 / p_width, 1.0))
+            n_y1 = max(0.0, min(vis_y1 / p_height, 1.0))
 
             # --- BRANCH BASED ON MODE ---
             if getattr(self, "redact_mode", "standard") == "rasterize":
-                # For rasterization, we just need to pass the normalized rect or handle it there.
-                # Currently rasterize expects exact geometry relative to Bottom/Right.
-                # Let's calculate geometry for the current page and pass it.
-                # Rasterization will assume all pages become images of this visual orientation.
-                # We need to de-normalize for the underlying PDF logic if we use it there, 
-                # but rasterizer creates new pages.
-                
-                # Let's calc visual rect in PDF points (unscaled) for current page
+                # Rasterization mode - existing logic
                 page = tab.doc.load_page(tab.current_page)
-                # Visual dimensions in points:
-                if page.rotation in (0, 180):
-                    vis_w_pts, vis_h_pts = page.rect.width, page.rect.height
-                else:
-                    vis_w_pts, vis_h_pts = page.rect.height, page.rect.width
+                vis_w_pts, vis_h_pts = page.rect.width, page.rect.height
                 
                 rect_w = (n_x1 - n_x0) * vis_w_pts
                 rect_h = (n_y1 - n_y0) * vis_h_pts
@@ -1439,99 +1382,78 @@ class PDFEditorModule(QWidget):
                     self.rasterize_with_redaction(tab, geometry)
                 return
 
-            # Standard Mode
-            reply = QMessageBox.question(self, "Confirm Redaction", 
-                                       "Redact this area on all pages?",
-                                       QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel)
+            # Standard Mode - Preview and Confirm
+            # Store the selection for visual preview (the PDFCanvas already shows the selection box)
+            # Keep the selection visible for preview
+            tab.label.selection = ui_rect
+            tab.label.update()
             
-            if reply == QMessageBox.Cancel: return
+            # Show confirm/undo dialog
+            from PySide6.QtWidgets import QDialog, QDialogButtonBox
             
-            pages_to_process = range(len(tab.doc)) if reply == QMessageBox.Yes else [tab.current_page]
+            dialog = QDialog(self)
+            dialog.setWindowTitle("Confirm Redaction")
+            dialog_layout = QVBoxLayout(dialog)
             
-            for pg_idx in pages_to_process:
+            preview_label = QLabel("Preview: The selected area (shown as blue box) will be redacted with white.")
+            preview_label.setWordWrap(True)
+            dialog_layout.addWidget(preview_label)
+            
+            all_pages_label = QLabel("Apply redaction to ALL pages at this relative position?")
+            all_pages_label.setStyleSheet("font-weight: bold;")
+            dialog_layout.addWidget(all_pages_label)
+            
+            button_box = QDialogButtonBox()
+            btn_confirm = button_box.addButton("Confirm (All Pages)", QDialogButtonBox.AcceptRole)
+            btn_undo = button_box.addButton("Undo", QDialogButtonBox.RejectRole)
+            dialog_layout.addWidget(button_box)
+            
+            btn_confirm.clicked.connect(dialog.accept)
+            btn_undo.clicked.connect(dialog.reject)
+            
+            result = dialog.exec()
+            
+            # Clear the preview selection
+            tab.label.selection = None
+            tab.label.update()
+            
+            if result != QDialog.Accepted:
+                # User clicked Undo
+                return
+            
+            # Apply redaction to all pages using PyMuPDF's derotation matrix
+            for pg_idx in range(len(tab.doc)):
                 pg = tab.doc.load_page(pg_idx)
-                rot = pg.rotation
                 
-                # 1. Determine Visual Dimensions of this page in Points
-                # Internal (Unrotated) Dimensions
-                w_int = pg.rect.width
-                h_int = pg.rect.height
+                # Visual dimensions (from pg.rect which accounts for rotation)
+                w_vis = pg.rect.width
+                h_vis = pg.rect.height
                 
-                if rot in (90, 270):
-                    w_vis = h_int
-                    h_vis = w_int
-                else:
-                    w_vis = w_int
-                    h_vis = h_int
-                
-                # 2. Map Normalized Coordinates to Visual Points for this page
-                # This ensures "Relative Visual Position" is preserved
+                # Map normalized coordinates to visual points for this page
                 vx0 = n_x0 * w_vis
                 vy0 = n_y0 * h_vis
                 vx1 = n_x1 * w_vis
                 vy1 = n_y1 * h_vis
                 
-                # 3. Transform Visual Rect (vx0, vy0, vx1, vy1) to Internal Rect (ix0, iy0, ix1, iy1)
-                # Apply Inverse Rotation Logic
+                # Use derotation_matrix to transform visual coords to internal (MediaBox) coords
+                # This handles all rotation cases correctly
+                derot = pg.derotation_matrix
                 
-                if rot == 0:
-                    rect = fitz.Rect(vx0, vy0, vx1, vy1)
-                    
-                elif rot == 90:
-                    # Vis x -> Int y (start from top?)
-                    # x_int = y_vis
-                    # y_int = w_vis - x_vis - (width of rect? no, x_vis is right edge?)
-                    # Let's map corners:
-                    # TL_vis (vx0, vy0) -> (vy0, w_vis - vx0) ? No.
-                    # 90 deg CW: Top Edge -> Right Edge.
-                    # Vis (x, 0) -> Int (H_int, x) ?? No.
-                    # Let's use the verified logic:
-                    # x_int = y_vis
-                    # y_int = h_int - x_vis  (Note: h_int == w_vis)
-                    
-                    # We have a Rect defined by 2 points. We must map both points (TL and BR) 
-                    # Use points to avoid confusion with min/max
-                    p1 = (vx0, vy0)
-                    p2 = (vx1, vy1)
-                    
-                    # Transform Function for 90 deg (Counter-Clockwise relative to content? No page rotation is CW)
-                    # Content at (x,y) appears at rot(x,y).
-                    # We perceive (vx, vy). We want (ix, iy).
-                    # ix = vy
-                    # iy = w_vis - vx (which is h_int - vx)
-                    
-                    ix0, iy0 = vy0, w_vis - vx0
-                    ix1, iy1 = vy1, w_vis - vx1
-                    rect = fitz.Rect(ix0, iy0, ix1, iy1).normalize()
-                    
-                elif rot == 180:
-                    # ix = w_vis - vx  (w_vis == w_int)
-                    # iy = h_vis - vy  (h_vis == h_int)
-                    ix0, iy0 = w_vis - vx0, h_vis - vy0
-                    ix1, iy1 = w_vis - vx1, h_vis - vy1
-                    rect = fitz.Rect(ix0, iy0, ix1, iy1).normalize()
-                    
-                elif rot == 270:
-                    # 270 CW. Top Edge -> Left Edge.
-                    # Vis (0, y) -> Int (y, 0) ? No.
-                    # Logic:
-                    # ix = h_vis - vy  (h_vis == w_int)
-                    # iy = vx
-                    ix0, iy0 = h_vis - vy0, vx0
-                    ix1, iy1 = h_vis - vy1, vx1
-                    rect = fitz.Rect(ix0, iy0, ix1, iy1).normalize()
+                # Transform corner points
+                p0 = fitz.Point(vx0, vy0) * derot
+                p1 = fitz.Point(vx1, vy1) * derot
                 
-                else:
-                    # Fallback for odd rotations
-                    rect = fitz.Rect(vx0, vy0, vx1, vy1)
+                # Create rect from transformed points and normalize
+                rect = fitz.Rect(p0, p1).normalize()
 
                 pg.add_redact_annot(rect, fill=(1, 1, 1))
                 pg.apply_redactions()
             
             tab.render()
-            QMessageBox.information(self, "Success", "Redaction applied.")
+            QMessageBox.information(self, "Success", f"Redaction applied to all {len(tab.doc)} pages.")
         except Exception as e:
             QMessageBox.critical(self, "Error", str(e))
+
     def show_advanced_menu(self):
         tab = self.current_tab()
         if not tab: return
@@ -1678,8 +1600,16 @@ class PDFEditorModule(QWidget):
         if not tab: return
             
         dialog = QDialog(self)
-        dialog.setWindowTitle("Add Page Numbers")
+        dialog.setWindowTitle("Add/Remove Page Numbers")
         layout = QVBoxLayout(dialog)
+        
+        # Remove Button at top
+        btn_remove = QPushButton("🗑️ Remove Added Page Numbers")
+        btn_remove.setStyleSheet("background-color: #dc2626; color: white; padding: 8px;")
+        btn_remove.clicked.connect(lambda: self.remove_page_numbers(tab, dialog))
+        layout.addWidget(btn_remove)
+        
+        layout.addWidget(QLabel("<hr>"))
         
         layout.addWidget(QLabel("Format:"))
         fmt_combo = QComboBox()
@@ -1733,6 +1663,9 @@ class PDFEditorModule(QWidget):
                 fmt = fmt_combo.currentText()
                 font_size = size_spin.value()
                 
+                # Generate unique tag for this batch
+                tag = f"PDFEDITOR_PN_{uuid.uuid4().hex[:8]}"
+                
                 current_seq_num = 1
                 for i in range(len(doc)):
                     pg_index = i + 1
@@ -1741,7 +1674,6 @@ class PDFEditorModule(QWidget):
                         continue
                     
                     if pg_index not in omitted:
-                        # Load page properly to avoid stale reference
                         page = doc.load_page(i)
                         
                         if fmt == "n":
@@ -1752,20 +1684,73 @@ class PDFEditorModule(QWidget):
                         rect = page.rect
                         pos_idx = pos_combo.currentIndex()
                         
-                        if pos_idx == 0: pt = fitz.Point(rect.width/2 - 30, rect.height - 20)
-                        elif pos_idx == 1: pt = fitz.Point(rect.width - 80, rect.height - 20)
-                        elif pos_idx == 2: pt = fitz.Point(20, rect.height - 20)
-                        elif pos_idx == 3: pt = fitz.Point(rect.width/2 - 30, 30)
-                        else: pt = fitz.Point(rect.width - 80, 30)
-                            
-                        page.insert_text(pt, text, fontname="times-roman", fontsize=font_size, color=(0, 0, 0))
+                        # Calculate annotation rectangle
+                        text_width = len(text) * (font_size * 0.6)
+                        text_height = font_size * 1.5
+                        
+                        if pos_idx == 0:  # Bottom Center
+                            x0 = (rect.width - text_width) / 2
+                            y0 = rect.height - 25 - text_height
+                        elif pos_idx == 1:  # Bottom Right
+                            x0 = rect.width - 20 - text_width
+                            y0 = rect.height - 25 - text_height
+                        elif pos_idx == 2:  # Bottom Left
+                            x0 = 20
+                            y0 = rect.height - 25 - text_height
+                        elif pos_idx == 3:  # Top Center
+                            x0 = (rect.width - text_width) / 2
+                            y0 = 15
+                        else:  # Top Right
+                            x0 = rect.width - 20 - text_width
+                            y0 = 15
+                        
+                        annot_rect = fitz.Rect(x0, y0, x0 + text_width, y0 + text_height)
+                        
+                        # Create FreeText annotation
+                        annot = page.add_freetext_annot(
+                            annot_rect,
+                            text,
+                            fontsize=font_size,
+                            fontname="helv",
+                            text_color=(0, 0, 0),
+                            fill_color=None,
+                            border_color=None,
+                            align=fitz.TEXT_ALIGN_CENTER
+                        )
+                        # Tag for later removal
+                        annot.set_info(title=tag)
+                        annot.update()
                     
                     current_seq_num += 1
                 
                 tab.render()
-                QMessageBox.information(self, "Success", "Page numbers added! Preview updated.")
+                QMessageBox.information(self, "Success", f"Page numbers added with tag '{tag}'! Use 'Remove' to delete only tagged items.")
             except Exception as e:
                 QMessageBox.critical(self, "Error", str(e))
+    
+    def remove_page_numbers(self, tab, parent_dialog):
+        """Remove only page number annotations that were added by this tool (tagged with PDFEDITOR_PN_)"""
+        try:
+            doc = tab.doc
+            removed_count = 0
+            
+            for page in doc:
+                annots_to_delete = []
+                for annot in page.annots():
+                    info = annot.info
+                    title = info.get("title", "")
+                    if title.startswith("PDFEDITOR_PN_"):
+                        annots_to_delete.append(annot)
+                
+                for annot in annots_to_delete:
+                    page.delete_annot(annot)
+                    removed_count += 1
+            
+            tab.render()
+            parent_dialog.accept()
+            QMessageBox.information(self, "Success", f"Removed {removed_count} page number annotations!")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", str(e))
 
     def add_header_footer(self):
         tab = self.current_tab()
@@ -1777,7 +1762,7 @@ class PDFEditorModule(QWidget):
         layout = QVBoxLayout(dialog)
         
         # Remove Button at top
-        btn_remove = QPushButton("🗑️ Remove All Headers/Footers")
+        btn_remove = QPushButton("🗑️ Remove Added Headers/Footers")
         btn_remove.setStyleSheet("background-color: #dc2626; color: white; padding: 8px;")
         btn_remove.clicked.connect(lambda: self.remove_header_footer(tab, dialog))
         layout.addWidget(btn_remove)
@@ -1859,17 +1844,6 @@ class PDFEditorModule(QWidget):
                 align = align_combo.currentText()
                 size = size_spin.value()
                 color_name = color_combo.currentText().lower()
-                font_name = font_combo.currentText()
-                
-                # Map to PyMuPDF font names
-                font_map = {
-                    "Times New Roman": "times-roman",
-                    "Times-Roman": "times-roman",
-                    "Helvetica": "helv",
-                    "Courier": "cour",
-                    "Arial": "helv"  # Arial maps to Helvetica
-                }
-                fontname = font_map.get(font_name, "times-roman")
                 
                 # Map color names to RGB tuples
                 colors = {
@@ -1881,67 +1855,76 @@ class PDFEditorModule(QWidget):
                 }
                 color = colors.get(color_name, (0, 0, 0))
                 
+                # Generate unique tag for this batch of annotations
+                tag = f"PDFEDITOR_HF_{uuid.uuid4().hex[:8]}"
+                
                 for page in doc:
                     rect = page.rect
-                    y = 30 if is_header else rect.height - 20
                     
-                    # Calculate X based on text length (approx)
-                    text_width = len(text) * (size * 0.5) 
+                    # Calculate text dimensions
+                    text_width = len(text) * (size * 0.6)
+                    text_height = size * 1.5
                     
-                    if align == "Center": x = (rect.width - text_width) / 2
-                    elif align == "Left": x = 20
-                    else: x = rect.width - 20 - text_width
+                    # Calculate position
+                    if is_header:
+                        y0 = 15
+                    else:
+                        y0 = rect.height - 15 - text_height
+                    y1 = y0 + text_height
                     
-                    page.insert_text(fitz.Point(x, y), text, fontname=fontname, fontsize=size, color=color)
+                    if align == "Center":
+                        x0 = (rect.width - text_width) / 2
+                    elif align == "Left":
+                        x0 = 20
+                    else:
+                        x0 = rect.width - 20 - text_width
+                    x1 = x0 + text_width
+                    
+                    # Create FreeText annotation (can be removed without affecting other content)
+                    annot_rect = fitz.Rect(x0, y0, x1, y1)
+                    annot = page.add_freetext_annot(
+                        annot_rect,
+                        text,
+                        fontsize=size,
+                        fontname="helv",  # Standard PDF font
+                        text_color=color,
+                        fill_color=None,  # Transparent background
+                        border_color=None,
+                        align=fitz.TEXT_ALIGN_CENTER if align == "Center" else (fitz.TEXT_ALIGN_LEFT if align == "Left" else fitz.TEXT_ALIGN_RIGHT)
+                    )
+                    # Tag the annotation for later removal
+                    annot.set_info(title=tag)
+                    annot.update()
                 
                 tab.render()
-                QMessageBox.information(self, "Success", "Header/Footer added! Preview updated.")
+                QMessageBox.information(self, "Success", f"Header/Footer added with tag '{tag}'! Use 'Remove' to delete only tagged items.")
             except Exception as e:
                 QMessageBox.critical(self, "Error", str(e))
     
     def remove_header_footer(self, tab, parent_dialog):
-        """Remove header/footer text matching common patterns (page numbers, dates, etc.)"""
+        """Remove only FreeText annotations that were added by this tool (tagged with PDFEDITOR_HF_)"""
         try:
             doc = tab.doc
             removed_count = 0
             
-            # Patterns that identify header/footer content
-            hf_patterns = [
-                r"^\d+$",                          # Just number
-                r"^Page\s*\d+",                    # Page 1...
-                r"^\d+\s*of\s*\d+$",               # 1 of 10
-                r"^-\s*\d+\s*-$",                  # - 1 -
-                r"^\[\d+\]$",                      # [1]
-                r"^\(\d+\)$",                      # (1)
-                r"^\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4}$",  # Dates
-                r"^(Draft|Confidential|Private)$",  # Common watermarks
-            ]
-            
             for page in doc:
-                rect = page.rect
-                # Define header and footer regions (top 60px and bottom 60px)
-                header_rect = fitz.Rect(0, 0, rect.width, 60)
-                footer_rect = fitz.Rect(0, rect.height - 60, rect.width, rect.height)
+                # Get all annotations on this page
+                annots_to_delete = []
+                for annot in page.annots():
+                    # Check if this is a tagged header/footer annotation
+                    info = annot.info
+                    title = info.get("title", "")
+                    if title.startswith("PDFEDITOR_HF_"):
+                        annots_to_delete.append(annot)
                 
-                for region in [header_rect, footer_rect]:
-                    blocks = page.get_text("dict", clip=region)["blocks"]
-                    for block in blocks:
-                        if "lines" in block:
-                            for line in block["lines"]:
-                                for span in line["spans"]:
-                                    text = span["text"].strip()
-                                    # Only remove if it matches a header/footer pattern
-                                    for pat in hf_patterns:
-                                        if re.match(pat, text, re.IGNORECASE):
-                                            bbox = fitz.Rect(span["bbox"])
-                                            page.add_redact_annot(bbox, fill=(1, 1, 1))
-                                            removed_count += 1
-                                            break
-                page.apply_redactions()
+                # Delete the tagged annotations
+                for annot in annots_to_delete:
+                    page.delete_annot(annot)
+                    removed_count += 1
             
             tab.render()
             parent_dialog.accept()
-            QMessageBox.information(self, "Success", f"Removed {removed_count} header/footer items!")
+            QMessageBox.information(self, "Success", f"Removed {removed_count} header/footer annotations!")
         except Exception as e:
             QMessageBox.critical(self, "Error", str(e))
 
