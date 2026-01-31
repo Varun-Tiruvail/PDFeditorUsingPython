@@ -1598,9 +1598,20 @@ class PDFEditorModule(QWidget):
     def add_page_numbers(self):
         tab = self.current_tab()
         if not tab: return
+        
+        # Default values (stored as class attributes)
+        if not hasattr(self, 'pn_defaults'):
+            self.pn_defaults = {
+                'dist_bottom': 25,
+                'dist_edge': 20,
+                'font_size': 10,
+                'format': 0,  # index in combo
+                'position': 0  # index in combo
+            }
             
         dialog = QDialog(self)
         dialog.setWindowTitle("Add/Remove Page Numbers")
+        dialog.resize(400, 450)
         layout = QVBoxLayout(dialog)
         
         # Remove Button at top
@@ -1614,6 +1625,7 @@ class PDFEditorModule(QWidget):
         layout.addWidget(QLabel("Format:"))
         fmt_combo = QComboBox()
         fmt_combo.addItems(["Page n of n", "n"])
+        fmt_combo.setCurrentIndex(self.pn_defaults['format'])
         layout.addWidget(fmt_combo)
         
         layout.addWidget(QLabel("Skip Pages (No Number, No Count - e.g. 1, 3-5):"))
@@ -1627,13 +1639,46 @@ class PDFEditorModule(QWidget):
         layout.addWidget(QLabel("Position:"))
         pos_combo = QComboBox()
         pos_combo.addItems(["Bottom Center", "Bottom Right", "Bottom Left", "Top Center", "Top Right"])
+        pos_combo.setCurrentIndex(self.pn_defaults['position'])
         layout.addWidget(pos_combo)
+        
+        # Distance inputs
+        dist_layout = QHBoxLayout()
+        dist_layout.addWidget(QLabel("Distance from Bottom/Top (pts):"))
+        dist_bottom_spin = QSpinBox()
+        dist_bottom_spin.setRange(5, 200)
+        dist_bottom_spin.setValue(self.pn_defaults['dist_bottom'])
+        dist_layout.addWidget(dist_bottom_spin)
+        layout.addLayout(dist_layout)
+        
+        edge_layout = QHBoxLayout()
+        edge_layout.addWidget(QLabel("Distance from Edge (pts):"))
+        dist_edge_spin = QSpinBox()
+        dist_edge_spin.setRange(5, 200)
+        dist_edge_spin.setValue(self.pn_defaults['dist_edge'])
+        edge_layout.addWidget(dist_edge_spin)
+        layout.addLayout(edge_layout)
         
         layout.addWidget(QLabel("Font Size:"))
         size_spin = QSpinBox()
         size_spin.setRange(6, 72)
-        size_spin.setValue(10)
+        size_spin.setValue(self.pn_defaults['font_size'])
         layout.addWidget(size_spin)
+        
+        # Set as Default button
+        def save_defaults():
+            self.pn_defaults = {
+                'dist_bottom': dist_bottom_spin.value(),
+                'dist_edge': dist_edge_spin.value(),
+                'font_size': size_spin.value(),
+                'format': fmt_combo.currentIndex(),
+                'position': pos_combo.currentIndex()
+            }
+            QMessageBox.information(dialog, "Saved", "Current settings saved as default!")
+        
+        btn_default = QPushButton("💾 Set as Default")
+        btn_default.clicked.connect(save_defaults)
+        layout.addWidget(btn_default)
         
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.accepted.connect(dialog.accept)
@@ -1662,6 +1707,8 @@ class PDFEditorModule(QWidget):
                 total_eligible = len(doc) - len([p for p in skipped if 1 <= p <= len(doc)])
                 fmt = fmt_combo.currentText()
                 font_size = size_spin.value()
+                dist_bottom = dist_bottom_spin.value()
+                dist_edge = dist_edge_spin.value()
                 
                 # Generate unique tag for this batch
                 tag = f"PDFEDITOR_PN_{uuid.uuid4().hex[:8]}"
@@ -1692,19 +1739,19 @@ class PDFEditorModule(QWidget):
                         
                         if pos_idx == 0:  # Bottom Center
                             vx0 = (vis_width - text_width) / 2
-                            vy0 = vis_height - 25 - text_height
+                            vy0 = vis_height - dist_bottom - text_height
                         elif pos_idx == 1:  # Bottom Right
-                            vx0 = vis_width - 20 - text_width
-                            vy0 = vis_height - 25 - text_height
+                            vx0 = vis_width - dist_edge - text_width
+                            vy0 = vis_height - dist_bottom - text_height
                         elif pos_idx == 2:  # Bottom Left
-                            vx0 = 20
-                            vy0 = vis_height - 25 - text_height
+                            vx0 = dist_edge
+                            vy0 = vis_height - dist_bottom - text_height
                         elif pos_idx == 3:  # Top Center
                             vx0 = (vis_width - text_width) / 2
-                            vy0 = 15
+                            vy0 = dist_bottom
                         else:  # Top Right
-                            vx0 = vis_width - 20 - text_width
-                            vy0 = 15
+                            vx0 = vis_width - dist_edge - text_width
+                            vy0 = dist_bottom
                         
                         vx1 = vx0 + text_width
                         vy1 = vy0 + text_height
@@ -1716,7 +1763,6 @@ class PDFEditorModule(QWidget):
                         annot_rect = fitz.Rect(p0, p1).normalize()
                         
                         # Determine text rotation for the annotation based on page rotation
-                        # So text appears upright in the visual view
                         rotate_angle = page.rotation
                         
                         # Create FreeText annotation
@@ -1738,7 +1784,7 @@ class PDFEditorModule(QWidget):
                     current_seq_num += 1
                 
                 tab.render()
-                QMessageBox.information(self, "Success", f"Page numbers added with tag '{tag}'! Use 'Remove' to delete only tagged items.")
+                QMessageBox.information(self, "Success", f"Page numbers added! Use 'Remove' to delete.")
             except Exception as e:
                 QMessageBox.critical(self, "Error", str(e))
     
@@ -1769,10 +1815,21 @@ class PDFEditorModule(QWidget):
     def add_header_footer(self):
         tab = self.current_tab()
         if not tab: return
+        
+        # Default values (stored as class attributes)
+        if not hasattr(self, 'hf_defaults'):
+            self.hf_defaults = {
+                'dist_top_bottom': 15,
+                'dist_edge': 20,
+                'font_size': 26,
+                'color': 'Red',
+                'type': 0,  # 0=Header, 1=Footer
+                'align': 0  # 0=Center, 1=Left, 2=Right
+            }
             
         dialog = QDialog(self)
         dialog.setWindowTitle("Add/Remove Header/Footer")
-        dialog.resize(450, 350)
+        dialog.resize(450, 450)
         layout = QVBoxLayout(dialog)
         
         # Remove Button at top
@@ -1794,54 +1851,77 @@ class PDFEditorModule(QWidget):
         layout.addWidget(QLabel("Type:"))
         type_combo = QComboBox()
         type_combo.addItems(["Header", "Footer"])
+        type_combo.setCurrentIndex(self.hf_defaults['type'])
         layout.addWidget(type_combo)
         
         layout.addWidget(QLabel("Alignment:"))
         align_combo = QComboBox()
         align_combo.addItems(["Center", "Left", "Right"])
+        align_combo.setCurrentIndex(self.hf_defaults['align'])
         layout.addWidget(align_combo)
         
-        # Font Selection
-        font_layout = QHBoxLayout()
-        font_layout.addWidget(QLabel("Font:"))
-        font_combo = QComboBox()
-        font_combo.addItems([
-            "Times New Roman",
-            "Times-Roman", 
-            "Helvetica",
-            "Courier",
-            "Arial"
-        ])
-        font_combo.setCurrentText("Times New Roman")  # Default
-        font_layout.addWidget(font_combo)
-        layout.addLayout(font_layout)
+        # Distance inputs
+        dist_layout = QHBoxLayout()
+        dist_layout.addWidget(QLabel("Distance from Top/Bottom (pts):"))
+        dist_tb_spin = QSpinBox()
+        dist_tb_spin.setRange(5, 200)
+        dist_tb_spin.setValue(self.hf_defaults['dist_top_bottom'])
+        dist_layout.addWidget(dist_tb_spin)
+        layout.addLayout(dist_layout)
         
-        # Styling
+        edge_layout = QHBoxLayout()
+        edge_layout.addWidget(QLabel("Distance from Edge (pts):"))
+        dist_edge_spin = QSpinBox()
+        dist_edge_spin.setRange(5, 200)
+        dist_edge_spin.setValue(self.hf_defaults['dist_edge'])
+        edge_layout.addWidget(dist_edge_spin)
+        layout.addLayout(edge_layout)
+        
+        # Styling (Font is always Times New Roman)
         style_layout = QHBoxLayout()
         
         style_layout.addWidget(QLabel("Size:"))
         size_spin = QSpinBox()
         size_spin.setRange(8, 72)
-        size_spin.setValue(12)
+        size_spin.setValue(self.hf_defaults['font_size'])
         style_layout.addWidget(size_spin)
         
         style_layout.addWidget(QLabel("Color:"))
         color_combo = QComboBox()
         color_combo.addItems(["Black", "Red", "Blue", "Green", "Gray"])
+        color_combo.setCurrentText(self.hf_defaults['color'])
         style_layout.addWidget(color_combo)
         
         layout.addLayout(style_layout)
+        
+        layout.addWidget(QLabel("Font: Times New Roman (fixed)"))
         
         # Preset Logic
         def load_draft():
             text_input.setText("DRAFT")
             type_combo.setCurrentText("Header")
             align_combo.setCurrentText("Center")
-            font_combo.setCurrentText("Times New Roman")
             size_spin.setValue(26)
             color_combo.setCurrentText("Red")
+            dist_tb_spin.setValue(15)
         
         btn_draft.clicked.connect(load_draft)
+        
+        # Set as Default button
+        def save_defaults():
+            self.hf_defaults = {
+                'dist_top_bottom': dist_tb_spin.value(),
+                'dist_edge': dist_edge_spin.value(),
+                'font_size': size_spin.value(),
+                'color': color_combo.currentText(),
+                'type': type_combo.currentIndex(),
+                'align': align_combo.currentIndex()
+            }
+            QMessageBox.information(dialog, "Saved", "Current settings saved as default!")
+        
+        btn_default = QPushButton("💾 Set as Default")
+        btn_default.clicked.connect(save_defaults)
+        layout.addWidget(btn_default)
         
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.accepted.connect(dialog.accept)
@@ -1858,6 +1938,8 @@ class PDFEditorModule(QWidget):
                 align = align_combo.currentText()
                 size = size_spin.value()
                 color_name = color_combo.currentText().lower()
+                dist_tb = dist_tb_spin.value()
+                dist_edge = dist_edge_spin.value()
                 
                 # Map color names to RGB tuples
                 colors = {
@@ -1883,17 +1965,17 @@ class PDFEditorModule(QWidget):
                     
                     # Calculate position in VISUAL coordinates
                     if is_header:
-                        vy0 = 15
+                        vy0 = dist_tb
                     else:
-                        vy0 = vis_height - 15 - text_height
+                        vy0 = vis_height - dist_tb - text_height
                     vy1 = vy0 + text_height
                     
                     if align == "Center":
                         vx0 = (vis_width - text_width) / 2
                     elif align == "Left":
-                        vx0 = 20
+                        vx0 = dist_edge
                     else:
-                        vx0 = vis_width - 20 - text_width
+                        vx0 = vis_width - dist_edge - text_width
                     vx1 = vx0 + text_width
                     
                     # Transform visual coords to internal coords using derotation matrix
@@ -1905,12 +1987,12 @@ class PDFEditorModule(QWidget):
                     # Determine text rotation for the annotation based on page rotation
                     rotate_angle = page.rotation
                     
-                    # Create FreeText annotation (can be removed without affecting other content)
+                    # Create FreeText annotation - Always use Times Roman font
                     annot = page.add_freetext_annot(
                         annot_rect,
                         text,
                         fontsize=size,
-                        fontname="helv",
+                        fontname="tiro",  # Times Roman
                         text_color=color,
                         fill_color=None,
                         border_color=None,
@@ -1922,7 +2004,7 @@ class PDFEditorModule(QWidget):
                     annot.update()
                 
                 tab.render()
-                QMessageBox.information(self, "Success", f"Header/Footer added with tag '{tag}'! Use 'Remove' to delete only tagged items.")
+                QMessageBox.information(self, "Success", "Header/Footer added! Use 'Remove' to delete.")
             except Exception as e:
                 QMessageBox.critical(self, "Error", str(e))
     
