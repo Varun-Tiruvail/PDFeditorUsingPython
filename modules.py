@@ -1680,31 +1680,44 @@ class PDFEditorModule(QWidget):
                             text = f"{current_seq_num}"
                         else:
                             text = f"Page {current_seq_num} of {total_eligible}"
-                            
-                        rect = page.rect
+                        
+                        # Use visual dimensions (page.rect accounts for rotation)
+                        vis_width = page.rect.width
+                        vis_height = page.rect.height
                         pos_idx = pos_combo.currentIndex()
                         
-                        # Calculate annotation rectangle
+                        # Calculate annotation rectangle in VISUAL coordinates
                         text_width = len(text) * (font_size * 0.6)
                         text_height = font_size * 1.5
                         
                         if pos_idx == 0:  # Bottom Center
-                            x0 = (rect.width - text_width) / 2
-                            y0 = rect.height - 25 - text_height
+                            vx0 = (vis_width - text_width) / 2
+                            vy0 = vis_height - 25 - text_height
                         elif pos_idx == 1:  # Bottom Right
-                            x0 = rect.width - 20 - text_width
-                            y0 = rect.height - 25 - text_height
+                            vx0 = vis_width - 20 - text_width
+                            vy0 = vis_height - 25 - text_height
                         elif pos_idx == 2:  # Bottom Left
-                            x0 = 20
-                            y0 = rect.height - 25 - text_height
+                            vx0 = 20
+                            vy0 = vis_height - 25 - text_height
                         elif pos_idx == 3:  # Top Center
-                            x0 = (rect.width - text_width) / 2
-                            y0 = 15
+                            vx0 = (vis_width - text_width) / 2
+                            vy0 = 15
                         else:  # Top Right
-                            x0 = rect.width - 20 - text_width
-                            y0 = 15
+                            vx0 = vis_width - 20 - text_width
+                            vy0 = 15
                         
-                        annot_rect = fitz.Rect(x0, y0, x0 + text_width, y0 + text_height)
+                        vx1 = vx0 + text_width
+                        vy1 = vy0 + text_height
+                        
+                        # Transform visual coords to internal coords using derotation matrix
+                        derot = page.derotation_matrix
+                        p0 = fitz.Point(vx0, vy0) * derot
+                        p1 = fitz.Point(vx1, vy1) * derot
+                        annot_rect = fitz.Rect(p0, p1).normalize()
+                        
+                        # Determine text rotation for the annotation based on page rotation
+                        # So text appears upright in the visual view
+                        rotate_angle = page.rotation
                         
                         # Create FreeText annotation
                         annot = page.add_freetext_annot(
@@ -1715,7 +1728,8 @@ class PDFEditorModule(QWidget):
                             text_color=(0, 0, 0),
                             fill_color=None,
                             border_color=None,
-                            align=fitz.TEXT_ALIGN_CENTER
+                            align=fitz.TEXT_ALIGN_CENTER,
+                            rotate=rotate_angle
                         )
                         # Tag for later removal
                         annot.set_info(title=tag)
@@ -1859,38 +1873,49 @@ class PDFEditorModule(QWidget):
                 tag = f"PDFEDITOR_HF_{uuid.uuid4().hex[:8]}"
                 
                 for page in doc:
-                    rect = page.rect
+                    # Use visual dimensions (page.rect accounts for rotation)
+                    vis_width = page.rect.width
+                    vis_height = page.rect.height
                     
                     # Calculate text dimensions
                     text_width = len(text) * (size * 0.6)
                     text_height = size * 1.5
                     
-                    # Calculate position
+                    # Calculate position in VISUAL coordinates
                     if is_header:
-                        y0 = 15
+                        vy0 = 15
                     else:
-                        y0 = rect.height - 15 - text_height
-                    y1 = y0 + text_height
+                        vy0 = vis_height - 15 - text_height
+                    vy1 = vy0 + text_height
                     
                     if align == "Center":
-                        x0 = (rect.width - text_width) / 2
+                        vx0 = (vis_width - text_width) / 2
                     elif align == "Left":
-                        x0 = 20
+                        vx0 = 20
                     else:
-                        x0 = rect.width - 20 - text_width
-                    x1 = x0 + text_width
+                        vx0 = vis_width - 20 - text_width
+                    vx1 = vx0 + text_width
+                    
+                    # Transform visual coords to internal coords using derotation matrix
+                    derot = page.derotation_matrix
+                    p0 = fitz.Point(vx0, vy0) * derot
+                    p1 = fitz.Point(vx1, vy1) * derot
+                    annot_rect = fitz.Rect(p0, p1).normalize()
+                    
+                    # Determine text rotation for the annotation based on page rotation
+                    rotate_angle = page.rotation
                     
                     # Create FreeText annotation (can be removed without affecting other content)
-                    annot_rect = fitz.Rect(x0, y0, x1, y1)
                     annot = page.add_freetext_annot(
                         annot_rect,
                         text,
                         fontsize=size,
-                        fontname="helv",  # Standard PDF font
+                        fontname="helv",
                         text_color=color,
-                        fill_color=None,  # Transparent background
+                        fill_color=None,
                         border_color=None,
-                        align=fitz.TEXT_ALIGN_CENTER if align == "Center" else (fitz.TEXT_ALIGN_LEFT if align == "Left" else fitz.TEXT_ALIGN_RIGHT)
+                        align=fitz.TEXT_ALIGN_CENTER if align == "Center" else (fitz.TEXT_ALIGN_LEFT if align == "Left" else fitz.TEXT_ALIGN_RIGHT),
+                        rotate=rotate_angle
                     )
                     # Tag the annotation for later removal
                     annot.set_info(title=tag)
