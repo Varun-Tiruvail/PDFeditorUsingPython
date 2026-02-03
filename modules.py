@@ -101,6 +101,47 @@ class Field(Base):
     height = Column(Float)
     template = relationship("Template", back_populates="fields")
 
+# ============================================================================
+# OCR TEMPLATE DATABASE MODELS
+# ============================================================================
+
+class OCRTemplate(Base):
+    """Template for extracting data from PDFs using labeled boxes"""
+    __tablename__ = "ocr_templates"
+    id = Column(Integer, primary_key=True)
+    name = Column(String, unique=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    pages = relationship("OCRPage", back_populates="template", cascade="all, delete-orphan", order_by="OCRPage.order_index")
+
+class OCRPage(Base):
+    """Represents a page in a PDF within a template"""
+    __tablename__ = "ocr_pages"
+    id = Column(Integer, primary_key=True)
+    template_id = Column(Integer, ForeignKey("ocr_templates.id"))
+    pdf_filename = Column(String)  # Original filename for reference
+    page_number = Column(Integer)
+    page_width = Column(Float)
+    page_height = Column(Float)
+    order_index = Column(Integer)  # Order in the template
+    template = relationship("OCRTemplate", back_populates="pages")
+    boxes = relationship("LabeledBox", back_populates="page", cascade="all, delete-orphan")
+
+class LabeledBox(Base):
+    """A labeled extraction region with optional anchor/value sub-regions"""
+    __tablename__ = "labeled_boxes"
+    id = Column(Integer, primary_key=True)
+    page_id = Column(Integer, ForeignKey("ocr_pages.id"))
+    parent_box_id = Column(Integer, ForeignKey("labeled_boxes.id"), nullable=True)
+    name = Column(String)
+    box_type = Column(String)  # 'label' (parent), 'anchor', 'value'
+    x = Column(Float)
+    y = Column(Float)
+    width = Column(Float)
+    height = Column(Float)
+    page = relationship("OCRPage", back_populates="boxes")
+    children = relationship("LabeledBox", backref="parent", remote_side=[id], foreign_keys=[parent_box_id])
+
+
 class Job(Base):
     __tablename__ = "jobs"
     id = Column(Integer, primary_key=True)
@@ -2070,356 +2111,1054 @@ class PDFEditorModule(QWidget):
             QMessageBox.critical(self, "Error", f"Failed to open file: {e}")
 
 # ============================================================================
-# OCR TRAINER MODULE
+# OCR TRAINER MODULE - Enhanced with Multi-PDF and Hierarchical Boxes
 # ============================================================================
 
-class BoundingBox:
-    def __init__(self, rect, name):
+class OCRBox:
+    """Represents a box with type (label/anchor/value) and optional parent"""
+    def __init__(self, rect, name, box_type='label', parent=None):
         self.rect = rect  # QRectF
         self.name = name
+        self.box_type = box_type  # 'label', 'anchor', 'value'
+        self.parent = parent  # Parent OCRBox for anchor/value
+        self.children = []  # Child boxes (anchors/values)
+        self.id = None  # Database ID, set after saving
+    
+    def add_child(self, child):
+        child.parent = self
+        self.children.append(child)
 
-class OCRTrainerModule(QWidget):
-    def __init__(self):
-        super().__init__()
-        self.current_pdf = None
-        self.current_image = None
-        self.boxes = []
-        self.setup_ui()
+class OCRCanvasWidget(QWidget):
+    """Enhanced canvas for drawing hierarchical OCR boxes"""
+    box_created = Signal(object)  # Emits OCRBox when created
+    box_selected = Signal(object)  # Emits selected OCRBox
     
-    def setup_ui(self):
-        layout = QHBoxLayout(self)
-        layout.setContentsMargins(10, 10, 10, 10)
-        
-        # Left Panel
-        left_panel = QVBoxLayout()
-        
-        title = QLabel("🔍 OCR Trainer")
-        title.setObjectName("moduleTitle")
-        title.setStyleSheet("font-size: 20px; font-weight: bold;")
-        left_panel.addWidget(title)
-        
-        btn_upload = QPushButton("📤 Upload PDF")
-        btn_upload.clicked.connect(self.upload_sample)
-        left_panel.addWidget(btn_upload)
-        
-        self.template_name = QLineEdit()
-        self.template_name.setPlaceholderText("Template Name")
-        left_panel.addWidget(self.template_name)
-        
-        btn_save = QPushButton("💾 Save Template")
-        btn_save.clicked.connect(self.save_template)
-        left_panel.addWidget(btn_save)
-        
-        lbl = QLabel("📥 Extract:")
-        left_panel.addWidget(lbl)
-        
-        self.template_combo = QComboBox()
-        self.load_templates()
-        left_panel.addWidget(self.template_combo)
-        
-        btn_extract = QPushButton("▶️ Run Extraction")
-        btn_extract.clicked.connect(self.run_extraction)
-        left_panel.addWidget(btn_extract)
-        
-        self.result_table = QTableWidget(0, 2)
-        self.result_table.setHorizontalHeaderLabels(["Field", "Value"])
-        left_panel.addWidget(self.result_table)
-        
-        btn_export = QPushButton("📊 Export to Excel")
-        btn_export.clicked.connect(self.export_excel)
-        left_panel.addWidget(btn_export)
-        
-        left_panel.addStretch()
-        
-        left_widget = QWidget()
-        left_widget.setLayout(left_panel)
-        left_widget.setFixedWidth(280)
-        
-        layout.addWidget(left_widget)
-        
-        # Right Panel - Canvas
-        self.canvas = CanvasWidget()
-        layout.addWidget(self.canvas)
+    # Colors for different box types
+    COLORS = {
+        'label': QColor(66, 133, 244),      # Blue - Parent/Label boxes
+        'anchor': QColor(52, 168, 83),      # Green - Anchor boxes
+        'value': QColor(251, 188, 5),       # Orange/Yellow - Value boxes
+        'selected': QColor(234, 67, 53),    # Red - Selected box
+        'drawing': QColor(100, 100, 100)    # Gray - Currently drawing
+    }
     
-    def upload_sample(self):
-        path, _ = QFileDialog.getOpenFileName(self, "Open PDF", "", "PDF Files (*.pdf)")
-        if path:
-            try:
-                doc = fitz.open(path)
-                page = doc.load_page(0)
-                
-                # Store ACTUAL page dimensions (not zoomed)
-                self.actual_page_width = page.rect.width
-                self.actual_page_height = page.rect.height
-                
-                # Render at 2x for better display
-                pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
-                img = QImage(pix.samples, pix.width, pix.height, pix.stride, QImage.Format_RGB888)
-                self.current_image = QPixmap.fromImage(img)
-                self.canvas.set_image(self.current_image, scale_factor=2.0)
-                self.current_pdf = path
-                doc.close()
-            except Exception as e:
-                QMessageBox.critical(self, "Error", str(e))
-    
-    def save_template(self):
-        name = self.template_name.text().strip()
-        if not name or not self.canvas.boxes:
-            QMessageBox.warning(self, "Warning", "Enter name and draw boxes")
-            return
-        
-        session = SessionLocal()
-        
-        # Check if template name already exists
-        existing = session.query(Template).filter(Template.name == name).first()
-        if existing:
-            reply = QMessageBox.question(self, "Template Exists", 
-                                        f"Template '{name}' already exists. Overwrite?",
-                                        QMessageBox.Yes | QMessageBox.No)
-            if reply == QMessageBox.No:
-                session.close()
-                return
-            else:
-                # Delete existing template (will cascade delete fields)
-                session.delete(existing)
-                session.commit()
-        
-        # Use ACTUAL page dimensions, not zoomed display dimensions
-        template = Template(name=name, 
-                          base_width=self.actual_page_width, 
-                          base_height=self.actual_page_height)
-        session.add(template)
-        session.commit()
-        
-        print("=" * 50)
-        print(f"SAVING TEMPLATE: {name}")
-        print(f"Base dimensions: {self.actual_page_width:.2f} x {self.actual_page_height:.2f}")
-        print(f"Scale factor: {self.canvas.scale_factor}")
-        print(f"Number of boxes: {len(self.canvas.boxes)}")
-        print("-" * 50)
-        
-        # Scale box coordinates back to original PDF size
-        for box in self.canvas.boxes:
-            scaled_x = box.rect.x() / self.canvas.scale_factor
-            scaled_y = box.rect.y() / self.canvas.scale_factor
-            scaled_w = box.rect.width() / self.canvas.scale_factor
-            scaled_h = box.rect.height() / self.canvas.scale_factor
-            
-            print(f"Box: {box.name}")
-            print(f"  Display coords: ({box.rect.x():.2f}, {box.rect.y():.2f}, {box.rect.width():.2f}, {box.rect.height():.2f})")
-            print(f"  Saved coords: ({scaled_x:.2f}, {scaled_y:.2f}, {scaled_w:.2f}, {scaled_h:.2f})")
-            
-            field = Field(template_id=template.id, name=box.name,
-                        x=scaled_x, y=scaled_y, 
-                        width=scaled_w, height=scaled_h)
-            session.add(field)
-        
-        session.commit()
-        session.close()
-        
-        print("=" * 50)
-        
-        QMessageBox.information(self, "Success", "Template saved!")
-        self.load_templates()
-    
-    def load_templates(self):
-        self.template_combo.clear()
-        session = SessionLocal()
-        templates = session.query(Template).all()
-        for t in templates:
-            self.template_combo.addItem(t.name, t.id)
-        session.close()
-    
-    def run_extraction(self):
-        if self.template_combo.count() == 0:
-            return
-        
-        path, _ = QFileDialog.getOpenFileName(self, "Select PDF to Extract", "", "PDF Files (*.pdf)")
-        if not path:
-            return
-        
-        template_id = self.template_combo.currentData()
-        session = SessionLocal()
-        template = session.query(Template).filter(Template.id == template_id).first()
-        
-        try:
-            doc = fitz.open(path)
-            page = doc.load_page(0)
-            page_rect = page.rect
-            
-            # Print debug info
-            print("=" * 50)
-            print(f"EXTRACTION DEBUG")
-            print(f"Template: {template.name}")
-            print(f"Template base dimensions: {template.base_width:.2f} x {template.base_height:.2f}")
-            print(f"PDF page dimensions: {page_rect.width:.2f} x {page_rect.height:.2f}")
-            
-            scale_x = page_rect.width / template.base_width
-            scale_y = page_rect.height / template.base_height
-            
-            print(f"Scale factors: X={scale_x:.4f}, Y={scale_y:.4f}")
-            print(f"Number of fields: {len(template.fields)}")
-            print("-" * 50)
-            
-            self.result_table.setRowCount(len(template.fields))
-            
-            for i, field in enumerate(template.fields):
-                # Calculate scaled coordinates
-                x0 = field.x * scale_x
-                y0 = field.y * scale_y
-                x1 = (field.x + field.width) * scale_x
-                y1 = (field.y + field.height) * scale_y
-                
-                # Add small padding (2px) to handle minor shifts
-                padding = 2
-                rect = fitz.Rect(x0 - padding, y0 - padding, x1 + padding, y1 + padding)
-                
-                print(f"Field: {field.name}")
-                print(f"  Stored coords: ({field.x:.2f}, {field.y:.2f}, {field.width:.2f}, {field.height:.2f})")
-                print(f"  Scaled rect (w/ padding): ({rect.x0:.2f}, {rect.y0:.2f}) -> ({rect.x1:.2f}, {rect.y1:.2f})")
-                
-                # Try to extract text
-                text = page.get_text("text", clip=rect).strip()
-                
-                # If that doesn't work, try textbox method
-                if not text:
-                    text = page.get_textbox(rect).strip()
-                
-                print(f"  Raw extracted: '{text}'")
-                
-                # SMART EXTRACTION:
-                # If the text starts with the field name (e.g. Field="Name", Text="Name: Varun"),
-                # strip the field name to get just the value.
-                import re
-                # Pattern: Start of string, Field Name (case insensitive), optional colon/hyphen, whitespace
-                pattern = f"^{re.escape(field.name)}[:\\-\\s]*"
-                match = re.search(pattern, text, re.IGNORECASE)
-                if match:
-                    cleaned_text = re.sub(pattern, "", text, count=1, flags=re.IGNORECASE).strip()
-                    if cleaned_text:
-                        print(f"  Smart Cleaned: '{text}' -> '{cleaned_text}'")
-                        text = cleaned_text
-                
-                print(f"  Final Value: '{text}'")
-                print()
-                
-                self.result_table.setItem(i, 0, QTableWidgetItem(field.name))
-                self.result_table.setItem(i, 1, QTableWidgetItem(text))
-            
-            # Create a visual preview with rectangles drawn
-            pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
-            img = QImage(pix.samples, pix.width, pix.height, pix.stride, QImage.Format_RGB888)
-            preview_pixmap = QPixmap.fromImage(img)
-            
-            # Draw extraction rectangles on the preview using QPainter
-            from PySide6.QtGui import QPainter
-            painter = QPainter(preview_pixmap)
-            pen = QPen(QColor(255, 0, 0), 3)
-            painter.setPen(pen)
-            
-            for field in template.fields:
-                x0 = field.x * scale_x * 2
-                y0 = field.y * scale_y * 2
-                w = field.width * scale_x * 2
-                h = field.height * scale_y * 2
-                painter.drawRect(QRectF(x0, y0, w, h))
-            
-            painter.end()
-            
-            # Create a simple preview window
-            preview = QLabel()
-            preview.setPixmap(preview_pixmap)
-            preview.setWindowTitle("Extraction Preview (Red boxes show extraction areas)")
-            preview.show()
-            preview.setStyleSheet("background: black;")
-            
-            # Store reference to keep window alive
-            self.preview_window = preview
-            
-            doc.close()
-            
-            print("=" * 50)
-            QMessageBox.information(self, "Success", f"Extracted {len(template.fields)} fields!\nCheck the preview window to see extraction areas.")
-            
-        except Exception as e:
-            print(f"ERROR: {e}")
-            import traceback
-            traceback.print_exc()
-            QMessageBox.critical(self, "Error", str(e))
-        finally:
-            session.close()
-    
-    def export_excel(self):
-        if self.result_table.rowCount() == 0:
-            return
-        
-        path, _ = QFileDialog.getSaveFileName(self, "Save Excel", "", "Excel Files (*.xlsx)")
-        if path:
-            data = []
-            for i in range(self.result_table.rowCount()):
-                data.append([
-                    self.result_table.item(i, 0).text(),
-                    self.result_table.item(i, 1).text()
-                ])
-            df = pd.DataFrame(data, columns=["Field", "Value"])
-            df.to_excel(path, index=False)
-            QMessageBox.information(self, "Success", "Exported to Excel!")
-
-class CanvasWidget(QWidget):
     def __init__(self):
         super().__init__()
         self.pixmap = None
-        self.boxes = []
+        self.boxes = []  # List of OCRBox
         self.start_point = None
         self.current_rect = None
         self.scale_factor = 1.0
         self.setMinimumSize(400, 400)
+        self.selected_box = None
+        self.current_mode = 'label'  # 'label', 'anchor', 'value'
+        self.active_parent_box = None  # For anchor/value drawing
+        self.setMouseTracking(True)
+        self.setFocusPolicy(Qt.StrongFocus)
+        
+        # Handle size for resize operations
+        self.handle_size = 8
+        self.drag_mode = None  # 'move', 'resize_*', None
+        self.drag_start = None
+        self.resize_handle = None
     
     def set_image(self, pixmap, scale_factor=1.0):
         self.pixmap = pixmap
         self.boxes = []
         self.scale_factor = scale_factor
-        self.setFixedSize(pixmap.size())
+        self.selected_box = None
+        self.active_parent_box = None
+        if pixmap:
+            self.setFixedSize(pixmap.size())
         self.update()
     
+    def set_boxes(self, boxes):
+        """Set boxes from loaded template"""
+        self.boxes = boxes
+        self.update()
+    
+    def set_mode(self, mode):
+        """Set drawing mode: 'label', 'anchor', or 'value'"""
+        self.current_mode = mode
+        if mode == 'label':
+            self.active_parent_box = None
+        self.update()
+    
+    def set_active_parent(self, parent_box):
+        """Set the active parent box for anchor/value drawing"""
+        self.active_parent_box = parent_box
+        self.selected_box = parent_box
+        self.update()
+    
+    def get_handle_rects(self, box):
+        """Get resize handle rectangles for a box"""
+        r = box.rect.toRect()
+        s = self.handle_size
+        hs = s // 2
+        return {
+            'tl': QRect(r.left() - hs, r.top() - hs, s, s),
+            'tr': QRect(r.right() - hs, r.top() - hs, s, s),
+            'bl': QRect(r.left() - hs, r.bottom() - hs, s, s),
+            'br': QRect(r.right() - hs, r.bottom() - hs, s, s),
+        }
+    
+    def get_handle_at(self, pos, box):
+        """Check if position is on a resize handle"""
+        for name, rect in self.get_handle_rects(box).items():
+            if rect.contains(pos):
+                return name
+        return None
+    
     def paintEvent(self, event):
-        from PySide6.QtGui import QPainter
         if not self.pixmap:
             return
         
         painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
         painter.drawPixmap(0, 0, self.pixmap)
         
-        pen = QPen(QColor(255, 0, 0), 2)
+        # Draw all boxes
+        for box in self.boxes:
+            self._draw_box(painter, box)
+            # Draw children
+            for child in box.children:
+                self._draw_box(painter, child)
+        
+        # Draw current drawing rect
+        if self.current_rect:
+            pen = QPen(self.COLORS['drawing'], 2, Qt.DashLine)
+            painter.setPen(pen)
+            painter.setBrush(QBrush(QColor(100, 100, 100, 50)))
+            painter.drawRect(self.current_rect.toRect())
+        
+        # Draw mode indicator
+        self._draw_mode_indicator(painter)
+    
+    def _draw_box(self, painter, box):
+        """Draw a single box with appropriate styling"""
+        is_selected = box == self.selected_box
+        color = self.COLORS['selected'] if is_selected else self.COLORS.get(box.box_type, self.COLORS['label'])
+        
+        # Box outline
+        pen_width = 3 if is_selected else 2
+        pen = QPen(color, pen_width)
         painter.setPen(pen)
         
-        for box in self.boxes:
-            painter.drawRect(box.rect.toRect())
-            painter.drawText(box.rect.topLeft().toPoint(), box.name)
+        # Semi-transparent fill
+        fill_color = QColor(color)
+        fill_color.setAlpha(40)
+        painter.setBrush(QBrush(fill_color))
         
-        if self.current_rect:
-            pen.setColor(QColor(0, 0, 255))
-            painter.setPen(pen)
-            painter.drawRect(self.current_rect.toRect())
+        rect = box.rect.toRect()
+        painter.drawRect(rect)
+        
+        # Draw label with background
+        label = f"[{box.box_type[0].upper()}] {box.name}"
+        font = painter.font()
+        font.setBold(True)
+        font.setPointSize(9)
+        painter.setFont(font)
+        
+        text_rect = painter.fontMetrics().boundingRect(label)
+        label_bg = QRect(rect.left(), rect.top() - text_rect.height() - 4, 
+                        text_rect.width() + 8, text_rect.height() + 4)
+        
+        # Label background
+        painter.fillRect(label_bg, color)
+        painter.setPen(QPen(Qt.white))
+        painter.drawText(label_bg.adjusted(4, 2, -4, -2), Qt.AlignLeft | Qt.AlignVCenter, label)
+        
+        # Draw resize handles if selected
+        if is_selected:
+            painter.setBrush(QBrush(Qt.white))
+            painter.setPen(QPen(color, 1))
+            for handle_rect in self.get_handle_rects(box).values():
+                painter.drawRect(handle_rect)
+    
+    def _draw_mode_indicator(self, painter):
+        """Draw current mode indicator in corner"""
+        mode_labels = {
+            'label': '📦 Label Mode',
+            'anchor': '🎯 Anchor Mode',
+            'value': '📝 Value Mode'
+        }
+        label = mode_labels.get(self.current_mode, '')
+        
+        font = painter.font()
+        font.setBold(True)
+        font.setPointSize(10)
+        painter.setFont(font)
+        
+        color = self.COLORS.get(self.current_mode, self.COLORS['label'])
+        text_rect = painter.fontMetrics().boundingRect(label)
+        bg_rect = QRect(10, 10, text_rect.width() + 16, text_rect.height() + 8)
+        
+        painter.fillRect(bg_rect, QColor(0, 0, 0, 180))
+        painter.setPen(QPen(color))
+        painter.drawText(bg_rect, Qt.AlignCenter, label)
     
     def mousePressEvent(self, event):
-        if event.button() == Qt.LeftButton and self.pixmap:
+        if event.button() != Qt.LeftButton or not self.pixmap:
+            return
+        
+        pos = event.position().toPoint()
+        
+        # Check if clicking on selected box's resize handle
+        if self.selected_box:
+            handle = self.get_handle_at(pos, self.selected_box)
+            if handle:
+                self.drag_mode = f'resize_{handle}'
+                self.drag_start = pos
+                self.resize_handle = handle
+                return
+        
+        # Check if clicking on any existing box
+        clicked_box = None
+        for box in reversed(self.boxes):  # Check topmost first
+            if box.rect.contains(QPointF(pos)):
+                clicked_box = box
+                break
+            for child in box.children:
+                if child.rect.contains(QPointF(pos)):
+                    clicked_box = child
+                    break
+            if clicked_box:
+                break
+        
+        if clicked_box:
+            if clicked_box == self.selected_box:
+                # Start moving
+                self.drag_mode = 'move'
+                self.drag_start = pos
+            else:
+                # Select the box
+                self.selected_box = clicked_box
+                self.box_selected.emit(clicked_box)
+                self.update()
+        else:
+            # Start drawing new box
+            self.selected_box = None
             self.start_point = event.position()
+            self.current_rect = QRectF(self.start_point, self.start_point)
+        
+        self.update()
     
     def mouseMoveEvent(self, event):
-        if self.start_point:
+        pos = event.position().toPoint()
+        
+        # Update cursor based on context
+        if self.selected_box and not self.drag_mode:
+            handle = self.get_handle_at(pos, self.selected_box)
+            if handle:
+                if handle in ['tl', 'br']:
+                    self.setCursor(Qt.SizeFDiagCursor)
+                else:
+                    self.setCursor(Qt.SizeBDiagCursor)
+            elif self.selected_box.rect.contains(QPointF(pos)):
+                self.setCursor(Qt.SizeAllCursor)
+            else:
+                self.setCursor(Qt.CrossCursor)
+        else:
+            self.setCursor(Qt.CrossCursor)
+        
+        # Handle dragging
+        if self.drag_mode and self.drag_start:
+            dx = pos.x() - self.drag_start.x()
+            dy = pos.y() - self.drag_start.y()
+            
+            if self.drag_mode == 'move':
+                self.selected_box.rect.translate(dx, dy)
+            elif self.drag_mode.startswith('resize_'):
+                r = self.selected_box.rect
+                handle = self.drag_mode.split('_')[1]
+                if 'l' in handle:
+                    r.setLeft(r.left() + dx)
+                if 'r' in handle:
+                    r.setRight(r.right() + dx)
+                if 't' in handle:
+                    r.setTop(r.top() + dy)
+                if 'b' in handle:
+                    r.setBottom(r.bottom() + dy)
+                self.selected_box.rect = r.normalized()
+            
+            self.drag_start = pos
+            self.update()
+        
+        # Drawing new box
+        elif self.start_point:
             self.current_rect = QRectF(self.start_point, event.position()).normalized()
             self.update()
     
     def mouseReleaseEvent(self, event):
-        if self.current_rect:
-            from PySide6.QtWidgets import QInputDialog
-            name, ok = QInputDialog.getText(self, "Field Name", "Enter field name:")
-            if ok and name:
-                self.boxes.append(BoundingBox(self.current_rect, name))
-            self.current_rect = None
-            self.start_point = None
+        if self.drag_mode:
+            self.drag_mode = None
+            self.drag_start = None
+            self.resize_handle = None
             self.update()
+            return
+        
+        if self.current_rect and self.current_rect.width() > 10 and self.current_rect.height() > 10:
+            # Create new box based on mode
+            name, ok = QInputDialog.getText(self, "Box Name", 
+                f"Enter name for {self.current_mode} box:")
+            if ok and name:
+                new_box = OCRBox(self.current_rect, name, self.current_mode)
+                
+                if self.current_mode == 'label':
+                    self.boxes.append(new_box)
+                    self.active_parent_box = new_box
+                elif self.active_parent_box:
+                    self.active_parent_box.add_child(new_box)
+                else:
+                    QMessageBox.warning(self, "No Parent", 
+                        "Please select a Label box first before adding anchor/value boxes.")
+                
+                self.selected_box = new_box
+                self.box_created.emit(new_box)
+        
+        self.current_rect = None
+        self.start_point = None
+        self.update()
+    
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key_Delete and self.selected_box:
+            self.delete_selected_box()
+    
+    def delete_selected_box(self):
+        """Delete the currently selected box"""
+        if not self.selected_box:
+            return
+        
+        box = self.selected_box
+        
+        # Remove from parent's children or main list
+        if box.parent:
+            box.parent.children.remove(box)
+        elif box in self.boxes:
+            self.boxes.remove(box)
+        
+        self.selected_box = None
+        self.update()
+    
+    def clear_boxes(self):
+        """Clear all boxes"""
+        self.boxes = []
+        self.selected_box = None
+        self.active_parent_box = None
+        self.update()
+
+
+class OCRTrainerModule(QWidget):
+    """Enhanced OCR Trainer with multi-PDF support and hierarchical boxes"""
+    
+    def __init__(self):
+        super().__init__()
+        # PDF management
+        self.loaded_pdfs = []  # List of (filename, fitz.Document)
+        self.current_pdf_index = -1
+        self.current_page_index = 0
+        
+        # Page dimensions cache
+        self.page_dimensions = {}  # (pdf_idx, page_idx) -> (width, height)
+        
+        # Box data per page
+        self.page_boxes = {}  # (pdf_idx, page_idx) -> [OCRBox]
+        
+        # Extraction results
+        self.extraction_results = []
+        
+        self.setup_ui()
+        self.load_template_list()
+    
+    def setup_ui(self):
+        main_layout = QHBoxLayout(self)
+        main_layout.setContentsMargins(10, 10, 10, 10)
+        main_layout.setSpacing(10)
+        
+        # =================== LEFT PANEL ===================
+        left_panel = QVBoxLayout()
+        left_panel.setSpacing(8)
+        
+        # Title
+        title = QLabel("🔍 OCR Template Builder")
+        title.setStyleSheet("font-size: 18px; font-weight: bold; color: #4285F4;")
+        left_panel.addWidget(title)
+        
+        # --- PDF Management Section ---
+        pdf_section = QLabel("📁 PDF Files")
+        pdf_section.setStyleSheet("font-weight: bold; margin-top: 10px;")
+        left_panel.addWidget(pdf_section)
+        
+        btn_layout = QHBoxLayout()
+        self.btn_add_pdf = QPushButton("➕ Add")
+        self.btn_add_pdf.clicked.connect(self.add_pdfs)
+        self.btn_remove_pdf = QPushButton("➖ Remove")
+        self.btn_remove_pdf.clicked.connect(self.remove_pdf)
+        btn_layout.addWidget(self.btn_add_pdf)
+        btn_layout.addWidget(self.btn_remove_pdf)
+        left_panel.addLayout(btn_layout)
+        
+        self.pdf_list = QListWidget()
+        self.pdf_list.setMaximumHeight(120)
+        self.pdf_list.currentRowChanged.connect(self.on_pdf_selected)
+        left_panel.addWidget(self.pdf_list)
+        
+        # --- Page Navigation ---
+        nav_section = QLabel("📄 Page Navigation")
+        nav_section.setStyleSheet("font-weight: bold; margin-top: 10px;")
+        left_panel.addWidget(nav_section)
+        
+        nav_layout = QHBoxLayout()
+        self.btn_prev_page = QPushButton("◀")
+        self.btn_prev_page.setFixedWidth(40)
+        self.btn_prev_page.clicked.connect(lambda: self.navigate_page(-1))
+        self.lbl_page = QLabel("Page 0/0")
+        self.lbl_page.setAlignment(Qt.AlignCenter)
+        self.btn_next_page = QPushButton("▶")
+        self.btn_next_page.setFixedWidth(40)
+        self.btn_next_page.clicked.connect(lambda: self.navigate_page(1))
+        nav_layout.addWidget(self.btn_prev_page)
+        nav_layout.addWidget(self.lbl_page, stretch=1)
+        nav_layout.addWidget(self.btn_next_page)
+        left_panel.addLayout(nav_layout)
+        
+        # --- Drawing Mode ---
+        mode_section = QLabel("🎨 Drawing Mode")
+        mode_section.setStyleSheet("font-weight: bold; margin-top: 10px;")
+        left_panel.addWidget(mode_section)
+        
+        mode_layout = QHBoxLayout()
+        self.btn_mode_label = QPushButton("📦 Label")
+        self.btn_mode_label.setCheckable(True)
+        self.btn_mode_label.setChecked(True)
+        self.btn_mode_label.clicked.connect(lambda: self.set_mode('label'))
+        
+        self.btn_mode_anchor = QPushButton("🎯 Anchor")
+        self.btn_mode_anchor.setCheckable(True)
+        self.btn_mode_anchor.clicked.connect(lambda: self.set_mode('anchor'))
+        
+        self.btn_mode_value = QPushButton("📝 Value")
+        self.btn_mode_value.setCheckable(True)
+        self.btn_mode_value.clicked.connect(lambda: self.set_mode('value'))
+        
+        mode_layout.addWidget(self.btn_mode_label)
+        mode_layout.addWidget(self.btn_mode_anchor)
+        mode_layout.addWidget(self.btn_mode_value)
+        left_panel.addLayout(mode_layout)
+        
+        # Style mode buttons
+        for btn in [self.btn_mode_label, self.btn_mode_anchor, self.btn_mode_value]:
+            btn.setStyleSheet("""
+                QPushButton { padding: 8px; border-radius: 4px; }
+                QPushButton:checked { background: #4285F4; color: white; }
+            """)
+        
+        # --- Template Management ---
+        template_section = QLabel("💾 Template")
+        template_section.setStyleSheet("font-weight: bold; margin-top: 10px;")
+        left_panel.addWidget(template_section)
+        
+        self.template_name_input = QLineEdit()
+        self.template_name_input.setPlaceholderText("Enter template name...")
+        left_panel.addWidget(self.template_name_input)
+        
+        save_layout = QHBoxLayout()
+        self.btn_save_template = QPushButton("💾 Save Template")
+        self.btn_save_template.clicked.connect(self.save_template)
+        self.btn_save_template.setStyleSheet("background: #34A853; color: white; padding: 8px;")
+        save_layout.addWidget(self.btn_save_template)
+        left_panel.addLayout(save_layout)
+        
+        # --- Load Template ---
+        load_section = QLabel("📥 Load Template")
+        load_section.setStyleSheet("font-weight: bold; margin-top: 10px;")
+        left_panel.addWidget(load_section)
+        
+        self.template_combo = QComboBox()
+        left_panel.addWidget(self.template_combo)
+        
+        extract_layout = QHBoxLayout()
+        self.btn_run_extraction = QPushButton("▶️ Run Extraction")
+        self.btn_run_extraction.clicked.connect(self.run_extraction)
+        self.btn_run_extraction.setStyleSheet("background: #4285F4; color: white; padding: 8px;")
+        extract_layout.addWidget(self.btn_run_extraction)
+        left_panel.addLayout(extract_layout)
+        
+        # --- Export Options ---
+        export_layout = QHBoxLayout()
+        self.btn_export_excel = QPushButton("📊 Export Excel")
+        self.btn_export_excel.clicked.connect(self.export_excel)
+        self.btn_export_backup = QPushButton("📄 Export Backup PDF")
+        self.btn_export_backup.clicked.connect(self.export_backup_pdf)
+        export_layout.addWidget(self.btn_export_excel)
+        export_layout.addWidget(self.btn_export_backup)
+        left_panel.addLayout(export_layout)
+        
+        left_panel.addStretch()
+        
+        left_widget = QWidget()
+        left_widget.setLayout(left_panel)
+        left_widget.setFixedWidth(300)
+        main_layout.addWidget(left_widget)
+        
+        # =================== CENTER PANEL (Canvas) ===================
+        center_layout = QVBoxLayout()
+        
+        # Canvas in scroll area
+        self.scroll_area = QScrollArea()
+        self.scroll_area.setWidgetResizable(True)
+        self.scroll_area.setStyleSheet("background: #2d2d2d;")
+        
+        self.canvas = OCRCanvasWidget()
+        self.canvas.box_created.connect(self.on_box_created)
+        self.canvas.box_selected.connect(self.on_box_selected)
+        self.scroll_area.setWidget(self.canvas)
+        
+        center_layout.addWidget(self.scroll_area)
+        main_layout.addLayout(center_layout, stretch=2)
+        
+        # =================== RIGHT PANEL (Box List & Results) ===================
+        right_panel = QVBoxLayout()
+        right_panel.setSpacing(8)
+        
+        # --- Box List ---
+        box_section = QLabel("📋 Boxes on This Page")
+        box_section.setStyleSheet("font-weight: bold;")
+        right_panel.addWidget(box_section)
+        
+        self.box_tree = QListWidget()
+        self.box_tree.setMaximumHeight(200)
+        self.box_tree.itemClicked.connect(self.on_box_list_clicked)
+        right_panel.addWidget(self.box_tree)
+        
+        box_btn_layout = QHBoxLayout()
+        self.btn_delete_box = QPushButton("🗑️ Delete Box")
+        self.btn_delete_box.clicked.connect(self.delete_selected_box)
+        self.btn_clear_boxes = QPushButton("🧹 Clear All")
+        self.btn_clear_boxes.clicked.connect(self.clear_all_boxes)
+        box_btn_layout.addWidget(self.btn_delete_box)
+        box_btn_layout.addWidget(self.btn_clear_boxes)
+        right_panel.addLayout(box_btn_layout)
+        
+        # --- Extraction Results ---
+        results_section = QLabel("📊 Extraction Results")
+        results_section.setStyleSheet("font-weight: bold; margin-top: 15px;")
+        right_panel.addWidget(results_section)
+        
+        self.result_table = QTableWidget(0, 3)
+        self.result_table.setHorizontalHeaderLabels(["Label", "Anchor", "Value"])
+        self.result_table.horizontalHeader().setStretchLastSection(True)
+        right_panel.addWidget(self.result_table)
+        
+        right_panel.addStretch()
+        
+        right_widget = QWidget()
+        right_widget.setLayout(right_panel)
+        right_widget.setFixedWidth(350)
+        main_layout.addWidget(right_widget)
+    
+    def add_pdfs(self):
+        """Add multiple PDF files"""
+        paths, _ = QFileDialog.getOpenFileNames(self, "Select PDFs", "", "PDF Files (*.pdf)")
+        for path in paths:
+            try:
+                doc = fitz.open(path)
+                filename = os.path.basename(path)
+                self.loaded_pdfs.append((filename, doc, path))
+                self.pdf_list.addItem(f"📄 {filename} ({len(doc)} pages)")
+                
+                # Cache page dimensions
+                pdf_idx = len(self.loaded_pdfs) - 1
+                for page_idx in range(len(doc)):
+                    page = doc.load_page(page_idx)
+                    self.page_dimensions[(pdf_idx, page_idx)] = (page.rect.width, page.rect.height)
+                
+            except Exception as e:
+                QMessageBox.warning(self, "Error", f"Failed to open {path}: {e}")
+        
+        if self.loaded_pdfs and self.current_pdf_index < 0:
+            self.current_pdf_index = 0
+            self.current_page_index = 0
+            self.pdf_list.setCurrentRow(0)
+            self.render_current_page()
+    
+    def remove_pdf(self):
+        """Remove selected PDF"""
+        row = self.pdf_list.currentRow()
+        if row >= 0:
+            filename, doc, path = self.loaded_pdfs[row]
+            doc.close()
+            del self.loaded_pdfs[row]
+            self.pdf_list.takeItem(row)
+            
+            # Clean up boxes for this PDF
+            keys_to_remove = [k for k in self.page_boxes if k[0] == row]
+            for k in keys_to_remove:
+                del self.page_boxes[k]
+            
+            if not self.loaded_pdfs:
+                self.current_pdf_index = -1
+                self.canvas.set_image(None)
+            elif row <= self.current_pdf_index:
+                self.current_pdf_index = max(0, self.current_pdf_index - 1)
+                self.render_current_page()
+    
+    def on_pdf_selected(self, row):
+        """Handle PDF selection from list"""
+        if row >= 0 and row != self.current_pdf_index:
+            # Save current page boxes
+            self.save_current_page_boxes()
+            
+            self.current_pdf_index = row
+            self.current_page_index = 0
+            self.render_current_page()
+    
+    def navigate_page(self, delta):
+        """Navigate between pages"""
+        if self.current_pdf_index < 0:
+            return
+        
+        # Save current page boxes
+        self.save_current_page_boxes()
+        
+        filename, doc, path = self.loaded_pdfs[self.current_pdf_index]
+        new_page = self.current_page_index + delta
+        
+        if 0 <= new_page < len(doc):
+            self.current_page_index = new_page
+            self.render_current_page()
+    
+    def save_current_page_boxes(self):
+        """Save boxes from canvas to page_boxes dict"""
+        if self.current_pdf_index >= 0:
+            key = (self.current_pdf_index, self.current_page_index)
+            self.page_boxes[key] = list(self.canvas.boxes)
+    
+    def render_current_page(self):
+        """Render current page and load its boxes"""
+        if self.current_pdf_index < 0 or not self.loaded_pdfs:
+            return
+        
+        filename, doc, path = self.loaded_pdfs[self.current_pdf_index]
+        page = doc.load_page(self.current_page_index)
+        
+        # Update page label
+        self.lbl_page.setText(f"Page {self.current_page_index + 1}/{len(doc)}")
+        
+        # Render at 2x scale for clarity
+        scale = 2.0
+        pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale))
+        img = QImage(pix.samples, pix.width, pix.height, pix.stride, QImage.Format_RGB888)
+        pixmap = QPixmap.fromImage(img)
+        
+        self.canvas.set_image(pixmap, scale_factor=scale)
+        
+        # Load boxes for this page
+        key = (self.current_pdf_index, self.current_page_index)
+        if key in self.page_boxes:
+            self.canvas.set_boxes(self.page_boxes[key])
+        
+        self.update_box_list()
+    
+    def set_mode(self, mode):
+        """Set drawing mode"""
+        self.canvas.set_mode(mode)
+        
+        # Update button states
+        self.btn_mode_label.setChecked(mode == 'label')
+        self.btn_mode_anchor.setChecked(mode == 'anchor')
+        self.btn_mode_value.setChecked(mode == 'value')
+    
+    def on_box_created(self, box):
+        """Handle new box creation"""
+        self.save_current_page_boxes()
+        self.update_box_list()
+    
+    def on_box_selected(self, box):
+        """Handle box selection"""
+        if box and box.box_type == 'label':
+            self.canvas.set_active_parent(box)
+        self.update_box_list()
+    
+    def on_box_list_clicked(self, item):
+        """Handle click on box list item"""
+        # Find box by name
+        text = item.text()
+        for box in self.canvas.boxes:
+            if box.name in text:
+                self.canvas.selected_box = box
+                if box.box_type == 'label':
+                    self.canvas.set_active_parent(box)
+                self.canvas.update()
+                return
+            for child in box.children:
+                if child.name in text:
+                    self.canvas.selected_box = child
+                    self.canvas.update()
+                    return
+    
+    def update_box_list(self):
+        """Update the box list widget"""
+        self.box_tree.clear()
+        for box in self.canvas.boxes:
+            self.box_tree.addItem(f"📦 [L] {box.name}")
+            for child in box.children:
+                prefix = "🎯" if child.box_type == 'anchor' else "📝"
+                type_char = "A" if child.box_type == 'anchor' else "V"
+                self.box_tree.addItem(f"    {prefix} [{type_char}] {child.name}")
+    
+    def delete_selected_box(self):
+        """Delete selected box"""
+        self.canvas.delete_selected_box()
+        self.save_current_page_boxes()
+        self.update_box_list()
+    
+    def clear_all_boxes(self):
+        """Clear all boxes on current page"""
+        reply = QMessageBox.question(self, "Clear All", 
+            "Delete all boxes on this page?", QMessageBox.Yes | QMessageBox.No)
+        if reply == QMessageBox.Yes:
+            self.canvas.clear_boxes()
+            self.save_current_page_boxes()
+            self.update_box_list()
+    
+    def load_template_list(self):
+        """Load template names into combo box"""
+        self.template_combo.clear()
+        session = SessionLocal()
+        templates = session.query(OCRTemplate).all()
+        for t in templates:
+            self.template_combo.addItem(t.name, t.id)
+        session.close()
+    
+    def save_template(self):
+        """Save current template to database"""
+        name = self.template_name_input.text().strip()
+        if not name:
+            QMessageBox.warning(self, "Warning", "Please enter a template name.")
+            return
+        
+        # Save current page boxes first
+        self.save_current_page_boxes()
+        
+        # Check if any boxes exist
+        total_boxes = sum(len(boxes) for boxes in self.page_boxes.values())
+        if total_boxes == 0:
+            QMessageBox.warning(self, "Warning", "No boxes to save. Draw some boxes first.")
+            return
+        
+        session = SessionLocal()
+        
+        # Check for existing template
+        existing = session.query(OCRTemplate).filter(OCRTemplate.name == name).first()
+        if existing:
+            reply = QMessageBox.question(self, "Overwrite?", 
+                f"Template '{name}' exists. Overwrite?", QMessageBox.Yes | QMessageBox.No)
+            if reply == QMessageBox.No:
+                session.close()
+                return
+            session.delete(existing)
+            session.commit()
+        
+        # Create template
+        template = OCRTemplate(name=name)
+        session.add(template)
+        session.commit()
+        
+        # Save pages and boxes
+        order_idx = 0
+        for (pdf_idx, page_idx), boxes in self.page_boxes.items():
+            if not boxes:
+                continue
+            
+            filename, doc, path = self.loaded_pdfs[pdf_idx]
+            page_width, page_height = self.page_dimensions[(pdf_idx, page_idx)]
+            
+            ocr_page = OCRPage(
+                template_id=template.id,
+                pdf_filename=filename,
+                page_number=page_idx,
+                page_width=page_width,
+                page_height=page_height,
+                order_index=order_idx
+            )
+            session.add(ocr_page)
+            session.commit()
+            order_idx += 1
+            
+            # Save boxes
+            for box in boxes:
+                self._save_box_to_db(session, ocr_page.id, box, None)
+        
+        session.commit()
+        session.close()
+        
+        QMessageBox.information(self, "Success", f"Template '{name}' saved!")
+        self.load_template_list()
+    
+    def _save_box_to_db(self, session, page_id, box, parent_id):
+        """Recursively save box and its children"""
+        scale = self.canvas.scale_factor
+        
+        db_box = LabeledBox(
+            page_id=page_id,
+            parent_box_id=parent_id,
+            name=box.name,
+            box_type=box.box_type,
+            x=box.rect.x() / scale,
+            y=box.rect.y() / scale,
+            width=box.rect.width() / scale,
+            height=box.rect.height() / scale
+        )
+        session.add(db_box)
+        session.commit()
+        
+        for child in box.children:
+            self._save_box_to_db(session, page_id, child, db_box.id)
+    
+    def run_extraction(self):
+        """Run extraction using selected template"""
+        if self.template_combo.count() == 0:
+            QMessageBox.warning(self, "No Template", "Please save or select a template first.")
+            return
+        
+        # Select PDFs for extraction
+        paths, _ = QFileDialog.getOpenFileNames(self, "Select PDFs for Extraction", "", "PDF Files (*.pdf)")
+        if not paths:
+            return
+        
+        template_id = self.template_combo.currentData()
+        session = SessionLocal()
+        template = session.query(OCRTemplate).filter(OCRTemplate.id == template_id).first()
+        
+        if not template:
+            QMessageBox.warning(self, "Error", "Template not found.")
+            session.close()
+            return
+        
+        self.extraction_results = []
+        self.result_table.setRowCount(0)
+        
+        try:
+            for pdf_path in paths:
+                doc = fitz.open(pdf_path)
+                pdf_filename = os.path.basename(pdf_path)
+                
+                # For each page in template, try to find matching content
+                for ocr_page in template.pages:
+                    # Get boxes for this page
+                    boxes = session.query(LabeledBox).filter(
+                        LabeledBox.page_id == ocr_page.id,
+                        LabeledBox.box_type == 'label'
+                    ).all()
+                    
+                    for label_box in boxes:
+                        # Get anchor and value children
+                        anchors = [b for b in label_box.children if b.box_type == 'anchor']
+                        values = [b for b in label_box.children if b.box_type == 'value']
+                        
+                        # Try to find on each page
+                        best_match = self._find_box_on_pages(
+                            doc, label_box, anchors, values, 
+                            ocr_page.page_width, ocr_page.page_height
+                        )
+                        
+                        if best_match:
+                            row = self.result_table.rowCount()
+                            self.result_table.insertRow(row)
+                            self.result_table.setItem(row, 0, QTableWidgetItem(label_box.name))
+                            self.result_table.setItem(row, 1, QTableWidgetItem(best_match['anchor_text']))
+                            self.result_table.setItem(row, 2, QTableWidgetItem(best_match['value_text']))
+                            
+                            self.extraction_results.append({
+                                'pdf': pdf_filename,
+                                'label': label_box.name,
+                                'anchor': best_match['anchor_text'],
+                                'value': best_match['value_text']
+                            })
+                
+                doc.close()
+            
+            QMessageBox.information(self, "Complete", 
+                f"Extraction complete! Found {len(self.extraction_results)} values.")
+            
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Extraction failed: {e}")
+            import traceback
+            traceback.print_exc()
+        finally:
+            session.close()
+    
+    def _find_box_on_pages(self, doc, label_box, anchors, values, base_width, base_height):
+        """Find box content across all pages using anchor matching"""
+        
+        # Try original page first, then search all pages
+        pages_to_try = list(range(len(doc)))
+        
+        for page_idx in pages_to_try:
+            page = doc.load_page(page_idx)
+            page_rect = page.rect
+            
+            scale_x = page_rect.width / base_width
+            scale_y = page_rect.height / base_height
+            
+            anchor_text = ""
+            value_text = ""
+            
+            # Find anchor text
+            for anchor in anchors:
+                rect = fitz.Rect(
+                    anchor.x * scale_x, anchor.y * scale_y,
+                    (anchor.x + anchor.width) * scale_x,
+                    (anchor.y + anchor.height) * scale_y
+                )
+                text = page.get_text("text", clip=rect).strip()
+                if text:
+                    anchor_text += text + " "
+            
+            anchor_text = anchor_text.strip()
+            
+            # If anchor found, get value
+            if anchor_text or not anchors:
+                for value in values:
+                    rect = fitz.Rect(
+                        value.x * scale_x, value.y * scale_y,
+                        (value.x + value.width) * scale_x,
+                        (value.y + value.height) * scale_y
+                    )
+                    text = page.get_text("text", clip=rect).strip()
+                    if text:
+                        value_text += text + " "
+                
+                value_text = value_text.strip()
+                
+                if value_text:
+                    return {
+                        'page': page_idx,
+                        'anchor_text': anchor_text,
+                        'value_text': value_text
+                    }
+        
+        return None
+    
+    def export_excel(self):
+        """Export results to Excel"""
+        if not self.extraction_results:
+            QMessageBox.warning(self, "No Data", "No extraction results to export.")
+            return
+        
+        path, _ = QFileDialog.getSaveFileName(self, "Save Excel", "", "Excel Files (*.xlsx)")
+        if path:
+            df = pd.DataFrame(self.extraction_results)
+            df.to_excel(path, index=False)
+            QMessageBox.information(self, "Success", f"Exported to {path}")
+    
+    def export_backup_pdf(self):
+        """Export backup PDF with screenshots of all boxes"""
+        self.save_current_page_boxes()
+        
+        total_boxes = sum(len(boxes) for boxes in self.page_boxes.values())
+        if total_boxes == 0:
+            QMessageBox.warning(self, "No Boxes", "No boxes to export.")
+            return
+        
+        path, _ = QFileDialog.getSaveFileName(self, "Save Backup PDF", "", "PDF Files (*.pdf)")
+        if not path:
+            return
+        
+        try:
+            # Create new PDF
+            backup_doc = fitz.open()
+            
+            for (pdf_idx, page_idx), boxes in self.page_boxes.items():
+                if not boxes:
+                    continue
+                
+                filename, doc, orig_path = self.loaded_pdfs[pdf_idx]
+                page = doc.load_page(page_idx)
+                
+                # Get page as image
+                pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
+                
+                for box in boxes:
+                    # Create a page for each label box
+                    self._add_box_to_backup(backup_doc, pix, box, filename, page_idx)
+            
+            backup_doc.save(path)
+            backup_doc.close()
+            
+            QMessageBox.information(self, "Success", f"Backup PDF saved to {path}")
+            
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to create backup: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    def _add_box_to_backup(self, backup_doc, pix, box, filename, page_idx):
+        """Add a box screenshot to backup PDF"""
+        scale = self.canvas.scale_factor
+        
+        # Crop to box area with margin
+        margin = 20
+        x0 = max(0, int(box.rect.x()) - margin)
+        y0 = max(0, int(box.rect.y()) - margin)
+        x1 = min(pix.width, int(box.rect.x() + box.rect.width()) + margin)
+        y1 = min(pix.height, int(box.rect.y() + box.rect.height()) + margin)
+        
+        # Create cropped image
+        crop_rect = fitz.IRect(x0, y0, x1, y1)
+        cropped = fitz.Pixmap(pix, crop_rect)
+        
+        # Create new page in backup doc
+        width = x1 - x0 + 60
+        height = y1 - y0 + 100  # Extra space for labels
+        
+        new_page = backup_doc.new_page(width=width, height=height)
+        
+        # Add title
+        title = f"[{box.box_type.upper()}] {box.name}"
+        subtitle = f"Source: {filename}, Page {page_idx + 1}"
+        
+        new_page.insert_text((10, 20), title, fontsize=14, fontname="helv")
+        new_page.insert_text((10, 35), subtitle, fontsize=10, fontname="helv", color=(0.5, 0.5, 0.5))
+        
+        # Insert cropped image
+        img_rect = fitz.Rect(10, 50, width - 10, height - 10)
+        new_page.insert_image(img_rect, pixmap=cropped)
+        
+        # Draw box outlines on the image
+        # Red for the label box, green for anchors, orange for values
+        colors = {'label': (1, 0, 0), 'anchor': (0, 0.7, 0), 'value': (1, 0.6, 0)}
+        
+        # Draw main box outline
+        box_in_img = fitz.Rect(
+            10 + (box.rect.x() - x0),
+            50 + (box.rect.y() - y0),
+            10 + (box.rect.x() + box.rect.width() - x0),
+            50 + (box.rect.y() + box.rect.height() - y0)
+        )
+        shape = new_page.new_shape()
+        shape.draw_rect(box_in_img)
+        shape.finish(color=colors.get(box.box_type, (1, 0, 0)), width=2)
+        
+        # Draw children
+        for child in box.children:
+            child_rect = fitz.Rect(
+                10 + (child.rect.x() - x0),
+                50 + (child.rect.y() - y0),
+                10 + (child.rect.x() + child.rect.width() - x0),
+                50 + (child.rect.y() + child.rect.height() - y0)
+            )
+            shape.draw_rect(child_rect)
+            shape.finish(color=colors.get(child.box_type, (0, 0, 1)), width=2)
+        
+        shape.commit()
+        
+        # Recursively add children boxes
+        for child in box.children:
+            if child.children:  # If child has its own children
+                self._add_box_to_backup(backup_doc, pix, child, filename, page_idx)
+
 
 # ============================================================================
 # SCHEDULER MODULE
