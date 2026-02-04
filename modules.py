@@ -139,7 +139,15 @@ class LabeledBox(Base):
     width = Column(Float)
     height = Column(Float)
     page = relationship("OCRPage", back_populates="boxes")
-    children = relationship("LabeledBox", backref="parent", remote_side=[id], foreign_keys=[parent_box_id])
+    # Self-referential relationship: parent has many children
+    children = relationship("LabeledBox", 
+                           foreign_keys="LabeledBox.parent_box_id",
+                           back_populates="parent_box",
+                           lazy="joined")
+    parent_box = relationship("LabeledBox", 
+                             remote_side="LabeledBox.id",
+                             foreign_keys="LabeledBox.parent_box_id",
+                             back_populates="children")
 
 
 class Job(Base):
@@ -2312,17 +2320,28 @@ class OCRCanvasWidget(QWidget):
                 self.resize_handle = handle
                 return
         
-        # Check if clicking on any existing box
+        # In anchor/value mode, allow drawing inside the active parent box
+        if self.current_mode in ('anchor', 'value') and self.active_parent_box:
+            # Check if click is inside the active parent box - allow drawing
+            if self.active_parent_box.rect.contains(QPointF(pos)):
+                # Start drawing new sub-box
+                self.start_point = event.position()
+                self.current_rect = QRectF(self.start_point, self.start_point)
+                self.update()
+                return
+        
+        # Check if clicking on any existing box (for selection)
         clicked_box = None
         for box in reversed(self.boxes):  # Check topmost first
-            if box.rect.contains(QPointF(pos)):
-                clicked_box = box
-                break
+            # First check children (they're on top)
             for child in box.children:
                 if child.rect.contains(QPointF(pos)):
                     clicked_box = child
                     break
             if clicked_box:
+                break
+            if box.rect.contains(QPointF(pos)):
+                clicked_box = box
                 break
         
         if clicked_box:
@@ -2333,6 +2352,9 @@ class OCRCanvasWidget(QWidget):
             else:
                 # Select the box
                 self.selected_box = clicked_box
+                # If it's a label box, make it the active parent
+                if clicked_box.box_type == 'label':
+                    self.active_parent_box = clicked_box
                 self.box_selected.emit(clicked_box)
                 self.update()
         else:
@@ -2888,7 +2910,7 @@ class OCRTrainerModule(QWidget):
             
             # Save boxes
             for box in boxes:
-                self._save_box_to_db(session, ocr_page.id, box, None)
+                self._save_box_to_db(session, ocr_page.id, box, None, pdf_idx, page_idx)
         
         session.commit()
         session.close()
@@ -2896,14 +2918,33 @@ class OCRTrainerModule(QWidget):
         QMessageBox.information(self, "Success", f"Template '{name}' saved!")
         self.load_template_list()
     
-    def _save_box_to_db(self, session, page_id, box, parent_id):
-        """Recursively save box and its children"""
+    def _save_box_to_db(self, session, page_id, box, parent_id, pdf_idx=None, page_idx=None):
+        """Recursively save box and its children, extracting anchor text from PDF"""
         scale = self.canvas.scale_factor
+        
+        # Get the actual text for anchor boxes from the PDF
+        box_name = box.name
+        if box.box_type == 'anchor' and pdf_idx is not None and page_idx is not None:
+            # Extract actual text from the anchor region in the PDF
+            filename, doc, path = self.loaded_pdfs[pdf_idx]
+            page = doc.load_page(page_idx)
+            
+            # Get text from the anchor region
+            rect = fitz.Rect(
+                box.rect.x() / scale,
+                box.rect.y() / scale,
+                (box.rect.x() + box.rect.width()) / scale,
+                (box.rect.y() + box.rect.height()) / scale
+            )
+            extracted_text = page.get_text("text", clip=rect).strip()
+            if extracted_text:
+                # Store the extracted text as the name (for searching later)
+                box_name = extracted_text
         
         db_box = LabeledBox(
             page_id=page_id,
             parent_box_id=parent_id,
-            name=box.name,
+            name=box_name,
             box_type=box.box_type,
             x=box.rect.x() / scale,
             y=box.rect.y() / scale,
@@ -2914,10 +2955,10 @@ class OCRTrainerModule(QWidget):
         session.commit()
         
         for child in box.children:
-            self._save_box_to_db(session, page_id, child, db_box.id)
+            self._save_box_to_db(session, page_id, child, db_box.id, pdf_idx, page_idx)
     
     def run_extraction(self):
-        """Run extraction using selected template"""
+        """Run extraction on multiple PDFs using selected template"""
         if self.template_combo.count() == 0:
             QMessageBox.warning(self, "No Template", "Please save or select a template first.")
             return
@@ -2936,51 +2977,88 @@ class OCRTrainerModule(QWidget):
             session.close()
             return
         
-        self.extraction_results = []
+        # Get all label boxes from template to build column headers
+        all_labels = []
+        label_info = {}  # label_id -> (label_name, anchors, values, page_dims)
+        
+        for ocr_page in template.pages:
+            label_boxes = session.query(LabeledBox).filter(
+                LabeledBox.page_id == ocr_page.id,
+                LabeledBox.box_type == 'label'
+            ).all()
+            
+            for label_box in label_boxes:
+                if label_box.name not in [l['name'] for l in all_labels]:
+                    anchors = [b for b in label_box.children if b.box_type == 'anchor']
+                    values = [b for b in label_box.children if b.box_type == 'value']
+                    
+                    all_labels.append({
+                        'name': label_box.name,
+                        'id': label_box.id
+                    })
+                    label_info[label_box.id] = {
+                        'name': label_box.name,
+                        'anchors': anchors,
+                        'values': values,
+                        'page_width': ocr_page.page_width,
+                        'page_height': ocr_page.page_height
+                    }
+        
+        if not all_labels:
+            QMessageBox.warning(self, "No Labels", "Template has no label boxes defined.")
+            session.close()
+            return
+        
+        # Setup result table with dynamic columns: PDF, then one per label
+        self.result_table.clear()
         self.result_table.setRowCount(0)
+        columns = ["PDF Filename"] + [l['name'] for l in all_labels]
+        self.result_table.setColumnCount(len(columns))
+        self.result_table.setHorizontalHeaderLabels(columns)
+        
+        self.extraction_results = []
+        extracted_count = 0
         
         try:
             for pdf_path in paths:
                 doc = fitz.open(pdf_path)
                 pdf_filename = os.path.basename(pdf_path)
                 
-                # For each page in template, try to find matching content
-                for ocr_page in template.pages:
-                    # Get boxes for this page
-                    boxes = session.query(LabeledBox).filter(
-                        LabeledBox.page_id == ocr_page.id,
-                        LabeledBox.box_type == 'label'
-                    ).all()
+                # Extract data for this PDF - one value per label
+                row_data = {'PDF Filename': pdf_filename}
+                
+                for label in all_labels:
+                    info = label_info[label['id']]
                     
-                    for label_box in boxes:
-                        # Get anchor and value children
-                        anchors = [b for b in label_box.children if b.box_type == 'anchor']
-                        values = [b for b in label_box.children if b.box_type == 'value']
-                        
-                        # Try to find on each page
-                        best_match = self._find_box_on_pages(
-                            doc, label_box, anchors, values, 
-                            ocr_page.page_width, ocr_page.page_height
-                        )
-                        
-                        if best_match:
-                            row = self.result_table.rowCount()
-                            self.result_table.insertRow(row)
-                            self.result_table.setItem(row, 0, QTableWidgetItem(label_box.name))
-                            self.result_table.setItem(row, 1, QTableWidgetItem(best_match['anchor_text']))
-                            self.result_table.setItem(row, 2, QTableWidgetItem(best_match['value_text']))
-                            
-                            self.extraction_results.append({
-                                'pdf': pdf_filename,
-                                'label': label_box.name,
-                                'anchor': best_match['anchor_text'],
-                                'value': best_match['value_text']
-                            })
+                    # Find this label's value in the PDF
+                    match = self._find_box_on_pages(
+                        doc, None, info['anchors'], info['values'],
+                        info['page_width'], info['page_height']
+                    )
+                    
+                    if match:
+                        row_data[label['name']] = match['value_text']
+                        extracted_count += 1
+                    else:
+                        row_data[label['name']] = ""
                 
                 doc.close()
+                
+                # Add row to table
+                row_idx = self.result_table.rowCount()
+                self.result_table.insertRow(row_idx)
+                
+                for col_idx, col_name in enumerate(columns):
+                    value = row_data.get(col_name, "")
+                    self.result_table.setItem(row_idx, col_idx, QTableWidgetItem(value))
+                
+                self.extraction_results.append(row_data)
+            
+            # Resize columns to fit content
+            self.result_table.resizeColumnsToContents()
             
             QMessageBox.information(self, "Complete", 
-                f"Extraction complete! Found {len(self.extraction_results)} values.")
+                f"Extraction complete!\n{len(paths)} PDFs processed\n{extracted_count} values extracted")
             
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Extraction failed: {e}")
@@ -2990,43 +3068,62 @@ class OCRTrainerModule(QWidget):
             session.close()
     
     def _find_box_on_pages(self, doc, label_box, anchors, values, base_width, base_height):
-        """Find box content across all pages using anchor matching"""
+        """Find box content across all pages by searching for anchor text"""
         
-        # Try original page first, then search all pages
-        pages_to_try = list(range(len(doc)))
+        if not anchors:
+            return None
         
-        for page_idx in pages_to_try:
+        # Get the anchor text that was saved during template creation
+        anchor_search_text = ""
+        for anchor in anchors:
+            anchor_search_text += (anchor.name or "") + " "
+        anchor_search_text = anchor_search_text.strip()
+        
+        if not anchor_search_text:
+            return None
+        
+        # Calculate relative offset from anchor to value (based on original template)
+        # This is how far the value is from the anchor in the original template
+        value_offsets = []
+        for anchor in anchors:
+            for value in values:
+                offset_x = value.x - anchor.x
+                offset_y = value.y - anchor.y
+                value_offsets.append({
+                    'dx': offset_x / base_width,  # Normalize to percentage
+                    'dy': offset_y / base_height,
+                    'width': value.width / base_width,
+                    'height': value.height / base_height
+                })
+        
+        # Search all pages for the anchor text
+        for page_idx in range(len(doc)):
             page = doc.load_page(page_idx)
             page_rect = page.rect
             
-            scale_x = page_rect.width / base_width
-            scale_y = page_rect.height / base_height
+            # Search for anchor text in the page
+            text_instances = page.search_for(anchor_search_text)
             
-            anchor_text = ""
-            value_text = ""
-            
-            # Find anchor text
-            for anchor in anchors:
-                rect = fitz.Rect(
-                    anchor.x * scale_x, anchor.y * scale_y,
-                    (anchor.x + anchor.width) * scale_x,
-                    (anchor.y + anchor.height) * scale_y
-                )
-                text = page.get_text("text", clip=rect).strip()
-                if text:
-                    anchor_text += text + " "
-            
-            anchor_text = anchor_text.strip()
-            
-            # If anchor found, get value
-            if anchor_text or not anchors:
-                for value in values:
-                    rect = fitz.Rect(
-                        value.x * scale_x, value.y * scale_y,
-                        (value.x + value.width) * scale_x,
-                        (value.y + value.height) * scale_y
+            if text_instances:
+                # Found anchor! Use the first instance
+                anchor_rect = text_instances[0]
+                anchor_text = anchor_search_text
+                
+                value_text = ""
+                
+                # Extract value based on relative offset from anchor
+                for offset in value_offsets:
+                    value_rect = fitz.Rect(
+                        anchor_rect.x0 + (offset['dx'] * page_rect.width),
+                        anchor_rect.y0 + (offset['dy'] * page_rect.height),
+                        anchor_rect.x0 + (offset['dx'] * page_rect.width) + (offset['width'] * page_rect.width),
+                        anchor_rect.y0 + (offset['dy'] * page_rect.height) + (offset['height'] * page_rect.height)
                     )
-                    text = page.get_text("text", clip=rect).strip()
+                    
+                    # Make sure the rect is within page bounds
+                    value_rect = value_rect & page_rect
+                    
+                    text = page.get_text("text", clip=value_rect).strip()
                     if text:
                         value_text += text + " "
                 
@@ -3077,12 +3174,13 @@ class OCRTrainerModule(QWidget):
                 filename, doc, orig_path = self.loaded_pdfs[pdf_idx]
                 page = doc.load_page(page_idx)
                 
-                # Get page as image
-                pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
+                # Get page as image (scale 2x for quality)
+                mat = fitz.Matrix(2, 2)
+                pix = page.get_pixmap(matrix=mat)
                 
                 for box in boxes:
                     # Create a page for each label box
-                    self._add_box_to_backup(backup_doc, pix, box, filename, page_idx)
+                    self._add_box_to_backup(backup_doc, pix, box, filename, page_idx, mat)
             
             backup_doc.save(path)
             backup_doc.close()
@@ -3094,24 +3192,36 @@ class OCRTrainerModule(QWidget):
             import traceback
             traceback.print_exc()
     
-    def _add_box_to_backup(self, backup_doc, pix, box, filename, page_idx):
+    def _add_box_to_backup(self, backup_doc, pix, box, filename, page_idx, mat):
         """Add a box screenshot to backup PDF"""
-        scale = self.canvas.scale_factor
+        scale = 2  # We use 2x scale for pixmap
         
-        # Crop to box area with margin
-        margin = 20
-        x0 = max(0, int(box.rect.x()) - margin)
-        y0 = max(0, int(box.rect.y()) - margin)
-        x1 = min(pix.width, int(box.rect.x() + box.rect.width()) + margin)
-        y1 = min(pix.height, int(box.rect.y() + box.rect.height()) + margin)
+        # Calculate box coords in pixmap space (need to account for canvas scaling)
+        canvas_scale = self.canvas.scale_factor
         
-        # Create cropped image
+        # Convert canvas coords to original PDF coords, then to pixmap coords
+        x0 = int((box.rect.x() / canvas_scale) * scale)
+        y0 = int((box.rect.y() / canvas_scale) * scale)
+        x1 = int(((box.rect.x() + box.rect.width()) / canvas_scale) * scale)
+        y1 = int(((box.rect.y() + box.rect.height()) / canvas_scale) * scale)
+        
+        # Add margin
+        margin = 30
+        x0 = max(0, x0 - margin)
+        y0 = max(0, y0 - margin)
+        x1 = min(pix.width, x1 + margin)
+        y1 = min(pix.height, y1 + margin)
+        
+        # Create cropped image using PIL approach (more reliable)
         crop_rect = fitz.IRect(x0, y0, x1, y1)
-        cropped = fitz.Pixmap(pix, crop_rect)
+        
+        # Create new pixmap for the cropped area
+        cropped = fitz.Pixmap(pix.colorspace, crop_rect, pix.alpha)
+        cropped.copy(pix, crop_rect)
         
         # Create new page in backup doc
-        width = x1 - x0 + 60
-        height = y1 - y0 + 100  # Extra space for labels
+        width = x1 - x0 + 40
+        height = y1 - y0 + 80  # Extra space for labels
         
         new_page = backup_doc.new_page(width=width, height=height)
         
@@ -3126,38 +3236,11 @@ class OCRTrainerModule(QWidget):
         img_rect = fitz.Rect(10, 50, width - 10, height - 10)
         new_page.insert_image(img_rect, pixmap=cropped)
         
-        # Draw box outlines on the image
-        # Red for the label box, green for anchors, orange for values
-        colors = {'label': (1, 0, 0), 'anchor': (0, 0.7, 0), 'value': (1, 0.6, 0)}
-        
-        # Draw main box outline
-        box_in_img = fitz.Rect(
-            10 + (box.rect.x() - x0),
-            50 + (box.rect.y() - y0),
-            10 + (box.rect.x() + box.rect.width() - x0),
-            50 + (box.rect.y() + box.rect.height() - y0)
-        )
-        shape = new_page.new_shape()
-        shape.draw_rect(box_in_img)
-        shape.finish(color=colors.get(box.box_type, (1, 0, 0)), width=2)
-        
-        # Draw children
-        for child in box.children:
-            child_rect = fitz.Rect(
-                10 + (child.rect.x() - x0),
-                50 + (child.rect.y() - y0),
-                10 + (child.rect.x() + child.rect.width() - x0),
-                50 + (child.rect.y() + child.rect.height() - y0)
-            )
-            shape.draw_rect(child_rect)
-            shape.finish(color=colors.get(child.box_type, (0, 0, 1)), width=2)
-        
-        shape.commit()
-        
-        # Recursively add children boxes
-        for child in box.children:
-            if child.children:  # If child has its own children
-                self._add_box_to_backup(backup_doc, pix, child, filename, page_idx)
+        # Add info about children
+        if box.children:
+            child_info = ", ".join([f"{c.box_type}: {c.name}" for c in box.children])
+            new_page.insert_text((10, height - 15), f"Children: {child_info}", 
+                                fontsize=8, fontname="helv", color=(0.4, 0.4, 0.4))
 
 
 # ============================================================================
