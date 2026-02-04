@@ -2969,13 +2969,20 @@ class OCRTrainerModule(QWidget):
                         'value': value_text.strip()
                     })
         
-        # Show results in a message box
+        # Show results in a message box and print to terminal
         if results:
             result_text = f"TEST EXTRACTION RESULTS (Page rotation: {rotation}°):\n\n"
+            print(f"\n{'='*60}")
+            print(f"[TEST EXTRACT] Page rotation: {rotation}°")
+            print(f"{'='*60}")
             for r in results:
                 result_text += f"📦 Label: {r['label']}\n"
                 result_text += f"   🎯 Anchor: {r['anchor']}\n"
                 result_text += f"   📝 Value: {r['value']}\n\n"
+                print(f"Label: {r['label']}")
+                print(f"  Anchor: {r['anchor']}")
+                print(f"  Value: {r['value']}")
+            print(f"{'='*60}\n")
             QMessageBox.information(self, "Test Extraction", result_text)
         else:
             QMessageBox.warning(self, "No Results", "No text extracted. Make sure anchor and value boxes are drawn inside label boxes.")
@@ -3155,49 +3162,66 @@ class OCRTrainerModule(QWidget):
             return x, y, w, h
     
     def _save_box_to_db(self, session, page_id, box, parent_id, pdf_idx=None, page_idx=None):
-        """Recursively save box and its children, extracting anchor text from PDF"""
+        """Recursively save box and its children, extracting anchor text from PDF
+        
+        IMPORTANT: 
+        - We use TRANSFORMED coordinates for TEXT EXTRACTION (handles rotated pages correctly)
+        - We save VISUAL coordinates (so offset calculation works during extraction)
+        """
         scale = self.canvas.scale_factor
         
-        # Get page info
-        key = (pdf_idx, page_idx) if pdf_idx is not None and page_idx is not None else None
-        rotation = self.page_rotations.get(key, 0) if key else 0
-        page_dims = self.page_dimensions.get(key, (0, 0)) if key else (0, 0)
-        page_width, page_height = page_dims
-        
-        # Get visual coordinates (scaled back to PDF size)
+        # Get visual coordinates (scaled back to PDF visual size)
         vis_x = box.rect.x() / scale
         vis_y = box.rect.y() / scale
         vis_w = box.rect.width() / scale
         vis_h = box.rect.height() / scale
         
-        # Transform visual coordinates to PDF internal coordinates based on rotation
-        pdf_x, pdf_y, pdf_w, pdf_h = self.transform_visual_to_pdf_coords(
-            vis_x, vis_y, vis_w, vis_h, page_width, page_height, rotation
-        )
+        # Get page rotation and dimensions for text extraction
+        key = (pdf_idx, page_idx) if pdf_idx is not None and page_idx is not None else None
+        rotation = self.page_rotations.get(key, 0) if key else 0
+        page_dims = self.page_dimensions.get(key, (0, 0)) if key else (0, 0)
+        page_width, page_height = page_dims
         
         # Get the actual text for anchor boxes from the PDF
         box_name = box.name
         if box.box_type == 'anchor' and pdf_idx is not None and page_idx is not None:
-            # Extract actual text from the anchor region in the PDF
             filename, doc, path = self.loaded_pdfs[pdf_idx]
             page = doc.load_page(page_idx)
             
-            # Use visual coordinates for text extraction (PyMuPDF handles rotation)
-            rect = fitz.Rect(vis_x, vis_y, vis_x + vis_w, vis_y + vis_h)
+            # Use TRANSFORMED coordinates for text extraction (same as test_extract_current)
+            # This handles rotated pages correctly
+            pdf_x, pdf_y, pdf_w, pdf_h = self.transform_visual_to_pdf_coords(
+                vis_x, vis_y, vis_w, vis_h, page_width, page_height, rotation
+            )
+            
+            rect = fitz.Rect(pdf_x, pdf_y, pdf_x + pdf_w, pdf_y + pdf_h)
             extracted_text = page.get_text("text", clip=rect).strip()
+            
+            print(f"[DEBUG] Anchor extraction: visual=({vis_x:.1f},{vis_y:.1f}), transformed=({pdf_x:.1f},{pdf_y:.1f}), rotation={rotation}°")
+            
             if extracted_text:
-                # Store the extracted text as the name (for searching later)
                 box_name = extracted_text
+                print(f"[DEBUG] Saved anchor text: '{extracted_text}'")
+            else:
+                # Try with expanded rect
+                expanded_rect = rect + (-5, -5, 5, 5)
+                extracted_text = page.get_text("text", clip=expanded_rect).strip()
+                if extracted_text:
+                    box_name = extracted_text
+                    print(f"[DEBUG] Got anchor text with expanded rect: '{extracted_text}'")
+                else:
+                    print(f"[DEBUG] WARNING: No text extracted for anchor")
         
+        # Save VISUAL coordinates - these are used to calculate the offset during extraction
         db_box = LabeledBox(
             page_id=page_id,
             parent_box_id=parent_id,
             name=box_name,
             box_type=box.box_type,
-            x=pdf_x,
-            y=pdf_y,
-            width=pdf_w,
-            height=pdf_h
+            x=vis_x,        # Visual X (for offset calculation)
+            y=vis_y,        # Visual Y  
+            width=vis_w,    # Visual Width
+            height=vis_h    # Visual Height
         )
         session.add(db_box)
         session.commit()
@@ -3336,7 +3360,10 @@ class OCRTrainerModule(QWidget):
             anchor_search_text += (anchor.name or "") + " "
         anchor_search_text = anchor_search_text.strip()
         
+        print(f"[DEBUG] Searching for anchor text: '{anchor_search_text}'")
+        
         if not anchor_search_text:
+            print("[DEBUG] No anchor search text found!")
             return None
         
         # Get the first anchor and first value for offset calculation
@@ -3349,6 +3376,8 @@ class OCRTrainerModule(QWidget):
             try:
                 page = doc.load_page(page_idx)
                 target_rotation = page.rotation  # 0, 90, 180, 270
+                
+                print(f"[DEBUG] Searching page {page_idx}, rotation={target_rotation}°")
                 
                 # First try: Direct text search (PyMuPDF handles rotation internally)
                 text_instances = page.search_for(anchor_search_text)
@@ -3381,54 +3410,68 @@ class OCRTrainerModule(QWidget):
                     anchor_rect = text_instances[0]
                     anchor_text = anchor_search_text
                     
-                    # Calculate offset in stored coordinates (PDF internal)
-                    stored_dx = first_value.x - first_anchor.x
-                    stored_dy = first_value.y - first_anchor.y
-                    stored_w = first_value.width
-                    stored_h = first_value.height
+                    print(f"[DEBUG] Found anchor '{anchor_text[:30]}...' at {anchor_rect} on page {page_idx}")
+                    print(f"[DEBUG] Template rotation: {template_rotation}°, Target rotation: {target_rotation}°")
                     
-                    # Transform the offset based on target page rotation
-                    # The anchor_rect is in visual coordinates; we need to apply offset correctly
+                    # Our saved coordinates are in VISUAL space
+                    # But search_for() returns coordinates in RAW PDF space (internal/unrotated)
+                    # We need to transform our visual offset to raw PDF space
+                    
+                    # Original visual offset from anchor to value (from template)
+                    orig_dx = first_value.x - first_anchor.x
+                    orig_dy = first_value.y - first_anchor.y
+                    orig_w = first_value.width
+                    orig_h = first_value.height
+                    
+                    print(f"[DEBUG] Visual offset: dx={orig_dx:.1f}, dy={orig_dy:.1f}, w={orig_w:.1f}, h={orig_h:.1f}")
+                    
+                    # Transform visual offset to raw PDF space based on TARGET page rotation
+                    # KEY INSIGHT FROM DEBUG: For 90° rotation:
+                    # - Visual RIGHT (dx+) = Raw LOWER Y (dy-) because text reads bottom-to-top in raw
+                    # - Visual DOWN (dy+) = Raw RIGHT (dx+) 
                     if target_rotation == 0:
-                        # No rotation - apply offset directly
-                        vis_dx = stored_dx
-                        vis_dy = stored_dy
-                        vis_w = stored_w
-                        vis_h = stored_h
+                        pdf_dx = orig_dx
+                        pdf_dy = orig_dy
+                        pdf_w = orig_w
+                        pdf_h = orig_h
                     elif target_rotation == 90:
-                        # Page is rotated 90° anti-clockwise
-                        # Stored coords were transformed: (vis_x, vis_y) -> (vis_y, width - vis_x - vis_w)
-                        # So to reverse: stored (x, y) -> visual (page_width - y - h, x)
-                        # For offsets: stored_dx, stored_dy -> visual: (-stored_dy, stored_dx) with swapped w/h
-                        vis_dx = -stored_dy - stored_h  # Move "up" in stored = move "right" in visual
-                        vis_dy = stored_dx
-                        vis_w = stored_h
-                        vis_h = stored_w
+                        # Visual: value is to the RIGHT of anchor (dx positive)
+                        # Raw PDF: value is at LOWER Y (dy negative!) 
+                        # This is because for 90° CCW rotation, text that appears
+                        # to the right visually is actually at lower Y values in raw space
+                        pdf_dx = orig_dy   # Visual down -> Raw right
+                        pdf_dy = -orig_dx  # Visual right -> Raw LOWER Y (negative!)
+                        pdf_w = orig_h
+                        pdf_h = orig_w
                     elif target_rotation == 180:
-                        # Page is rotated 180°
-                        vis_dx = -stored_dx - stored_w
-                        vis_dy = -stored_dy - stored_h
-                        vis_w = stored_w
-                        vis_h = stored_h
+                        pdf_dx = -orig_dx
+                        pdf_dy = -orig_dy
+                        pdf_w = orig_w
+                        pdf_h = orig_h
                     elif target_rotation == 270:
-                        # Page is rotated 270° (90° clockwise)
-                        vis_dx = stored_dy
-                        vis_dy = -stored_dx - stored_w
-                        vis_w = stored_h
-                        vis_h = stored_w
+                        # Visual: value is to the RIGHT of anchor
+                        # Raw PDF: value is at HIGHER Y
+                        pdf_dx = -orig_dy
+                        pdf_dy = orig_dx
+                        pdf_w = orig_h
+                        pdf_h = orig_w
                     else:
-                        vis_dx = stored_dx
-                        vis_dy = stored_dy
-                        vis_w = stored_w
-                        vis_h = stored_h
+                        pdf_dx = orig_dx
+                        pdf_dy = orig_dy
+                        pdf_w = orig_w
+                        pdf_h = orig_h
                     
-                    # Calculate value rect in visual space
+                    print(f"[DEBUG] Raw PDF offset (rot={target_rotation}): dx={pdf_dx:.1f}, dy={pdf_dy:.1f}")
+                    
+                    # Calculate value rect in raw PDF space
                     value_rect = fitz.Rect(
-                        anchor_rect.x0 + vis_dx,
-                        anchor_rect.y0 + vis_dy,
-                        anchor_rect.x0 + vis_dx + vis_w,
-                        anchor_rect.y0 + vis_dy + vis_h
+                        anchor_rect.x0 + pdf_dx,
+                        anchor_rect.y0 + pdf_dy,
+                        anchor_rect.x0 + pdf_dx + pdf_w,
+                        anchor_rect.y0 + pdf_dy + pdf_h
                     )
+                    
+                    print(f"[DEBUG] Value rect: {value_rect}")
                     
                     # Normalize and clip to page
                     value_rect = value_rect.normalize()
@@ -3455,6 +3498,7 @@ class OCRTrainerModule(QWidget):
                         
                         if text:
                             value_text = text
+                            print(f"[DEBUG] Extracted value: '{value_text[:50]}...'")
                     
                     if value_text:
                         return {
