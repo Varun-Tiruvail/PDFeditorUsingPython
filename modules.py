@@ -3009,10 +3009,16 @@ class OCRTrainerModule(QWidget):
             session.close()
             return
         
-        # Setup result table with dynamic columns: PDF, then one per label
+        # Setup result table with dynamic columns: PDF, then Anchor + Value for each label
         self.result_table.clear()
         self.result_table.setRowCount(0)
-        columns = ["PDF Filename"] + [l['name'] for l in all_labels]
+        
+        # Create column headers: PDF Filename, Label1_Anchor, Label1_Value, Label2_Anchor, Label2_Value, ...
+        columns = ["PDF Filename"]
+        for label in all_labels:
+            columns.append(f"{label['name']}_Anchor")
+            columns.append(f"{label['name']}_Value")
+        
         self.result_table.setColumnCount(len(columns))
         self.result_table.setHorizontalHeaderLabels(columns)
         
@@ -3024,7 +3030,7 @@ class OCRTrainerModule(QWidget):
                 doc = fitz.open(pdf_path)
                 pdf_filename = os.path.basename(pdf_path)
                 
-                # Extract data for this PDF - one value per label
+                # Extract data for this PDF - anchor and value per label
                 row_data = {'PDF Filename': pdf_filename}
                 
                 for label in all_labels:
@@ -3037,10 +3043,12 @@ class OCRTrainerModule(QWidget):
                     )
                     
                     if match:
-                        row_data[label['name']] = match['value_text']
+                        row_data[f"{label['name']}_Anchor"] = match['anchor_text']
+                        row_data[f"{label['name']}_Value"] = match['value_text']
                         extracted_count += 1
                     else:
-                        row_data[label['name']] = ""
+                        row_data[f"{label['name']}_Anchor"] = ""
+                        row_data[f"{label['name']}_Value"] = ""
                 
                 doc.close()
                 
