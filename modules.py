@@ -2589,6 +2589,11 @@ class OCRTrainerModule(QWidget):
         self.btn_save_template.clicked.connect(self.save_template)
         self.btn_save_template.setStyleSheet("background: #34A853; color: white; padding: 8px;")
         save_layout.addWidget(self.btn_save_template)
+        
+        self.btn_test_extract = QPushButton("🧪 Test Extract")
+        self.btn_test_extract.clicked.connect(self.test_extract_current)
+        self.btn_test_extract.setStyleSheet("background: #FF9800; color: white; padding: 8px;")
+        save_layout.addWidget(self.btn_test_extract)
         left_panel.addLayout(save_layout)
         
         # --- Load Template ---
@@ -2626,9 +2631,42 @@ class OCRTrainerModule(QWidget):
         # =================== CENTER PANEL (Canvas) ===================
         center_layout = QVBoxLayout()
         
+        # Zoom toolbar
+        self.zoom_scale = 1.0  # Track current zoom level
+        zoom_toolbar = QHBoxLayout()
+        
+        self.btn_zoom_fit = QPushButton("⊡ Fit")
+        self.btn_zoom_fit.clicked.connect(self.zoom_fit)
+        self.btn_zoom_fit.setStyleSheet("padding: 5px 10px;")
+        self.btn_zoom_fit.setToolTip("Fit page to window")
+        
+        self.btn_zoom_out = QPushButton("➖ Zoom Out")
+        self.btn_zoom_out.clicked.connect(self.zoom_out)
+        self.btn_zoom_out.setStyleSheet("padding: 5px 10px;")
+        
+        self.zoom_label = QLabel("100%")
+        self.zoom_label.setStyleSheet("padding: 5px 15px; font-weight: bold;")
+        
+        self.btn_zoom_in = QPushButton("➕ Zoom In")
+        self.btn_zoom_in.clicked.connect(self.zoom_in)
+        self.btn_zoom_in.setStyleSheet("padding: 5px 10px;")
+        
+        self.btn_zoom_100 = QPushButton("100%")
+        self.btn_zoom_100.clicked.connect(self.zoom_reset)
+        self.btn_zoom_100.setStyleSheet("padding: 5px 10px;")
+        self.btn_zoom_100.setToolTip("Reset to 100%")
+        
+        zoom_toolbar.addWidget(self.btn_zoom_fit)
+        zoom_toolbar.addWidget(self.btn_zoom_out)
+        zoom_toolbar.addWidget(self.zoom_label)
+        zoom_toolbar.addWidget(self.btn_zoom_in)
+        zoom_toolbar.addWidget(self.btn_zoom_100)
+        zoom_toolbar.addStretch()
+        center_layout.addLayout(zoom_toolbar)
+        
         # Canvas in scroll area
         self.scroll_area = QScrollArea()
-        self.scroll_area.setWidgetResizable(True)
+        self.scroll_area.setWidgetResizable(False)  # Changed for zoom support
         self.scroll_area.setStyleSheet("background: #2d2d2d;")
         
         self.canvas = OCRCanvasWidget()
@@ -2781,6 +2819,140 @@ class OCRTrainerModule(QWidget):
             self.canvas.set_boxes(self.page_boxes[key])
         
         self.update_box_list()
+        self.update_zoom_label()
+    
+    def update_zoom_label(self):
+        """Update the zoom percentage label"""
+        self.zoom_label.setText(f"{int(self.zoom_scale * 100)}%")
+    
+    def zoom_fit(self):
+        """Fit the page to the scroll area"""
+        if self.current_pdf_index < 0 or not self.loaded_pdfs:
+            return
+        
+        # Get scroll area dimensions
+        scroll_width = self.scroll_area.viewport().width() - 20
+        scroll_height = self.scroll_area.viewport().height() - 20
+        
+        filename, doc, path = self.loaded_pdfs[self.current_pdf_index]
+        page = doc.load_page(self.current_page_index)
+        page_width = page.rect.width
+        page_height = page.rect.height
+        
+        # Calculate scale to fit
+        scale_x = scroll_width / page_width
+        scale_y = scroll_height / page_height
+        self.zoom_scale = min(scale_x, scale_y)
+        
+        self.apply_zoom()
+    
+    def zoom_in(self):
+        """Zoom in by 25%"""
+        self.zoom_scale = min(self.zoom_scale + 0.25, 5.0)
+        self.apply_zoom()
+    
+    def zoom_out(self):
+        """Zoom out by 25%"""
+        self.zoom_scale = max(self.zoom_scale - 0.25, 0.25)
+        self.apply_zoom()
+    
+    def zoom_reset(self):
+        """Reset zoom to 100%"""
+        self.zoom_scale = 1.0
+        self.apply_zoom()
+    
+    def apply_zoom(self):
+        """Apply the current zoom level to the canvas"""
+        if self.current_pdf_index < 0 or not self.loaded_pdfs:
+            return
+        
+        filename, doc, path = self.loaded_pdfs[self.current_pdf_index]
+        page = doc.load_page(self.current_page_index)
+        
+        # Render at zoom scale
+        pix = page.get_pixmap(matrix=fitz.Matrix(self.zoom_scale, self.zoom_scale))
+        img = QImage(pix.samples, pix.width, pix.height, pix.stride, QImage.Format_RGB888)
+        pixmap = QPixmap.fromImage(img)
+        
+        self.canvas.set_image(pixmap, scale_factor=self.zoom_scale)
+        self.update_zoom_label()
+        
+        # Rescale boxes to match new zoom
+        key = (self.current_pdf_index, self.current_page_index)
+        if key in self.page_boxes:
+            self.canvas.set_boxes(self.page_boxes[key])
+        self.canvas.update()
+    
+    def test_extract_current(self):
+        """Test extraction on current page's boxes before saving template"""
+        if self.current_pdf_index < 0 or not self.loaded_pdfs:
+            QMessageBox.warning(self, "No PDF", "Please load a PDF first.")
+            return
+        
+        self.save_current_page_boxes()
+        
+        key = (self.current_pdf_index, self.current_page_index)
+        boxes = self.page_boxes.get(key, [])
+        
+        if not boxes:
+            QMessageBox.warning(self, "No Boxes", "No boxes drawn on this page.")
+            return
+        
+        filename, doc, path = self.loaded_pdfs[self.current_pdf_index]
+        page = doc.load_page(self.current_page_index)
+        
+        results = []
+        
+        for box in boxes:
+            if box.box_type == 'label':
+                # Find anchor and value children
+                anchors = [b for b in box.children if b.box_type == 'anchor']
+                values_boxes = [b for b in box.children if b.box_type == 'value']
+                
+                anchor_text = ""
+                value_text = ""
+                
+                # Extract anchor text
+                for anchor in anchors:
+                    rect = fitz.Rect(
+                        anchor.rect.x() / self.zoom_scale,
+                        anchor.rect.y() / self.zoom_scale,
+                        (anchor.rect.x() + anchor.rect.width()) / self.zoom_scale,
+                        (anchor.rect.y() + anchor.rect.height()) / self.zoom_scale
+                    )
+                    text = page.get_text("text", clip=rect).strip()
+                    if text:
+                        anchor_text += text + " "
+                
+                # Extract value text
+                for val in values_boxes:
+                    rect = fitz.Rect(
+                        val.rect.x() / self.zoom_scale,
+                        val.rect.y() / self.zoom_scale,
+                        (val.rect.x() + val.rect.width()) / self.zoom_scale,
+                        (val.rect.y() + val.rect.height()) / self.zoom_scale
+                    )
+                    text = page.get_text("text", clip=rect).strip()
+                    if text:
+                        value_text += text + " "
+                
+                if anchor_text or value_text:
+                    results.append({
+                        'label': box.name,
+                        'anchor': anchor_text.strip(),
+                        'value': value_text.strip()
+                    })
+        
+        # Show results in a message box
+        if results:
+            result_text = "TEST EXTRACTION RESULTS:\n\n"
+            for r in results:
+                result_text += f"📦 Label: {r['label']}\n"
+                result_text += f"   🎯 Anchor: {r['anchor']}\n"
+                result_text += f"   📝 Value: {r['value']}\n\n"
+            QMessageBox.information(self, "Test Extraction", result_text)
+        else:
+            QMessageBox.warning(self, "No Results", "No text extracted. Make sure anchor and value boxes are drawn inside label boxes.")
     
     def set_mode(self, mode):
         """Set drawing mode"""
