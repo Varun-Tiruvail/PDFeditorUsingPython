@@ -3068,7 +3068,7 @@ class OCRTrainerModule(QWidget):
             session.close()
     
     def _find_box_on_pages(self, doc, label_box, anchors, values, base_width, base_height):
-        """Find box content across all pages by searching for anchor text"""
+        """Find box content across all pages by searching for anchor text with OCR support"""
         
         if not anchors:
             return None
@@ -3083,7 +3083,6 @@ class OCRTrainerModule(QWidget):
             return None
         
         # Calculate relative offset from anchor to value (based on original template)
-        # This is how far the value is from the anchor in the original template
         value_offsets = []
         for anchor in anchors:
             for value in values:
@@ -3098,43 +3097,118 @@ class OCRTrainerModule(QWidget):
         
         # Search all pages for the anchor text
         for page_idx in range(len(doc)):
-            page = doc.load_page(page_idx)
-            page_rect = page.rect
-            
-            # Search for anchor text in the page
-            text_instances = page.search_for(anchor_search_text)
-            
-            if text_instances:
-                # Found anchor! Use the first instance
-                anchor_rect = text_instances[0]
-                anchor_text = anchor_search_text
+            try:
+                page = doc.load_page(page_idx)
+                page_rect = page.rect
+                rotation = page.rotation  # Get page rotation (0, 90, 180, 270)
                 
-                value_text = ""
+                # First try: Direct text search
+                text_instances = page.search_for(anchor_search_text)
                 
-                # Extract value based on relative offset from anchor
-                for offset in value_offsets:
-                    value_rect = fitz.Rect(
-                        anchor_rect.x0 + (offset['dx'] * page_rect.width),
-                        anchor_rect.y0 + (offset['dy'] * page_rect.height),
-                        anchor_rect.x0 + (offset['dx'] * page_rect.width) + (offset['width'] * page_rect.width),
-                        anchor_rect.y0 + (offset['dy'] * page_rect.height) + (offset['height'] * page_rect.height)
-                    )
+                # Second try: Search with just the first few words (partial match)
+                if not text_instances:
+                    words = anchor_search_text.split()
+                    if len(words) > 1:
+                        # Try searching for first word only
+                        text_instances = page.search_for(words[0])
+                
+                # Third try: Get all text blocks and search manually
+                if not text_instances:
+                    text_blocks = page.get_text("blocks")  # Returns list of text blocks
+                    for block in text_blocks:
+                        if len(block) >= 5:  # block format: (x0, y0, x1, y1, text, block_no, block_type)
+                            block_text = str(block[4]).strip() if len(block) > 4 else ""
+                            # Check if anchor text is in this block (case-insensitive)
+                            if anchor_search_text.lower() in block_text.lower():
+                                text_instances = [fitz.Rect(block[0], block[1], block[2], block[3])]
+                                break
+                            # Try partial match with first word
+                            if words and words[0].lower() in block_text.lower():
+                                text_instances = [fitz.Rect(block[0], block[1], block[2], block[3])]
+                                break
+                
+                if text_instances:
+                    # Found anchor! Use the first instance
+                    anchor_rect = text_instances[0]
+                    anchor_text = anchor_search_text
                     
-                    # Make sure the rect is within page bounds
-                    value_rect = value_rect & page_rect
+                    value_text = ""
                     
-                    text = page.get_text("text", clip=value_rect).strip()
-                    if text:
-                        value_text += text + " "
-                
-                value_text = value_text.strip()
-                
-                if value_text:
-                    return {
-                        'page': page_idx,
-                        'anchor_text': anchor_text,
-                        'value_text': value_text
-                    }
+                    # Extract value based on relative offset from anchor
+                    for offset in value_offsets:
+                        # Calculate value rect position relative to anchor
+                        # Adjust for page rotation if needed
+                        if rotation == 0:
+                            value_rect = fitz.Rect(
+                                anchor_rect.x0 + (offset['dx'] * page_rect.width),
+                                anchor_rect.y0 + (offset['dy'] * page_rect.height),
+                                anchor_rect.x0 + (offset['dx'] * page_rect.width) + (offset['width'] * page_rect.width),
+                                anchor_rect.y0 + (offset['dy'] * page_rect.height) + (offset['height'] * page_rect.height)
+                            )
+                        elif rotation == 90:
+                            # Swap x/y for 90 degree rotation
+                            value_rect = fitz.Rect(
+                                anchor_rect.x0 - (offset['dy'] * page_rect.width),
+                                anchor_rect.y0 + (offset['dx'] * page_rect.height),
+                                anchor_rect.x0 - (offset['dy'] * page_rect.width) + (offset['height'] * page_rect.width),
+                                anchor_rect.y0 + (offset['dx'] * page_rect.height) + (offset['width'] * page_rect.height)
+                            )
+                        elif rotation == 180:
+                            value_rect = fitz.Rect(
+                                anchor_rect.x0 - (offset['dx'] * page_rect.width) - (offset['width'] * page_rect.width),
+                                anchor_rect.y0 - (offset['dy'] * page_rect.height) - (offset['height'] * page_rect.height),
+                                anchor_rect.x0 - (offset['dx'] * page_rect.width),
+                                anchor_rect.y0 - (offset['dy'] * page_rect.height)
+                            )
+                        elif rotation == 270:
+                            value_rect = fitz.Rect(
+                                anchor_rect.x0 + (offset['dy'] * page_rect.width),
+                                anchor_rect.y0 - (offset['dx'] * page_rect.height) - (offset['width'] * page_rect.height),
+                                anchor_rect.x0 + (offset['dy'] * page_rect.width) + (offset['height'] * page_rect.width),
+                                anchor_rect.y0 - (offset['dx'] * page_rect.height)
+                            )
+                        else:
+                            # Default to no rotation
+                            value_rect = fitz.Rect(
+                                anchor_rect.x0 + (offset['dx'] * page_rect.width),
+                                anchor_rect.y0 + (offset['dy'] * page_rect.height),
+                                anchor_rect.x0 + (offset['dx'] * page_rect.width) + (offset['width'] * page_rect.width),
+                                anchor_rect.y0 + (offset['dy'] * page_rect.height) + (offset['height'] * page_rect.height)
+                            )
+                        
+                        # Normalize the rect
+                        value_rect = value_rect.normalize()
+                        
+                        # Make sure the rect is within page bounds
+                        value_rect = value_rect & page_rect
+                        
+                        if not value_rect.is_empty:
+                            # Try to get text from the value region
+                            text = page.get_text("text", clip=value_rect).strip()
+                            
+                            # If no text found, try getting text blocks in that area
+                            if not text:
+                                blocks = page.get_text("blocks", clip=value_rect)
+                                for block in blocks:
+                                    if len(block) > 4:
+                                        text += str(block[4]).strip() + " "
+                                text = text.strip()
+                            
+                            if text:
+                                value_text += text + " "
+                    
+                    value_text = value_text.strip()
+                    
+                    if value_text:
+                        return {
+                            'page': page_idx,
+                            'anchor_text': anchor_text,
+                            'value_text': value_text
+                        }
+            except Exception as e:
+                # Log error but continue to next page
+                print(f"Error processing page {page_idx}: {e}")
+                continue
         
         return None
     
