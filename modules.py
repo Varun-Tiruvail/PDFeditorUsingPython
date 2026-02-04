@@ -122,6 +122,7 @@ class OCRPage(Base):
     page_number = Column(Integer)
     page_width = Column(Float)
     page_height = Column(Float)
+    page_rotation = Column(Integer, default=0)  # 0, 90, 180, or 270
     order_index = Column(Integer)  # Order in the template
     template = relationship("OCRTemplate", back_populates="pages")
     boxes = relationship("LabeledBox", back_populates="page", cascade="all, delete-orphan")
@@ -2480,8 +2481,12 @@ class OCRTrainerModule(QWidget):
         self.current_pdf_index = -1
         self.current_page_index = 0
         
-        # Page dimensions cache
+        # Page dimensions and rotation cache
         self.page_dimensions = {}  # (pdf_idx, page_idx) -> (width, height)
+        self.page_rotations = {}   # (pdf_idx, page_idx) -> rotation (0, 90, 180, 270)
+        
+        # Zoom scale for display
+        self.zoom_scale = 1.0
         
         # Box data per page
         self.page_boxes = {}  # (pdf_idx, page_idx) -> [OCRBox]
@@ -2805,16 +2810,23 @@ class OCRTrainerModule(QWidget):
         # Update page label
         self.lbl_page.setText(f"Page {self.current_page_index + 1}/{len(doc)}")
         
-        # Render at 2x scale for clarity
-        scale = 2.0
-        pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale))
+        # Track page rotation and dimensions
+        key = (self.current_pdf_index, self.current_page_index)
+        rotation = page.rotation  # 0, 90, 180, or 270
+        self.page_rotations[key] = rotation
+        
+        # Store the page's original (unrotated) dimensions
+        # page.rect gives the dimensions in the visual orientation (already rotated)
+        self.page_dimensions[key] = (page.rect.width, page.rect.height)
+        
+        # Render at zoom scale
+        pix = page.get_pixmap(matrix=fitz.Matrix(self.zoom_scale, self.zoom_scale))
         img = QImage(pix.samples, pix.width, pix.height, pix.stride, QImage.Format_RGB888)
         pixmap = QPixmap.fromImage(img)
         
-        self.canvas.set_image(pixmap, scale_factor=scale)
+        self.canvas.set_image(pixmap, scale_factor=self.zoom_scale)
         
         # Load boxes for this page
-        key = (self.current_pdf_index, self.current_page_index)
         if key in self.page_boxes:
             self.canvas.set_boxes(self.page_boxes[key])
         
@@ -2901,6 +2913,10 @@ class OCRTrainerModule(QWidget):
         filename, doc, path = self.loaded_pdfs[self.current_pdf_index]
         page = doc.load_page(self.current_page_index)
         
+        # Get page rotation and dimensions
+        rotation = self.page_rotations.get(key, 0)
+        page_width, page_height = self.page_dimensions.get(key, (page.rect.width, page.rect.height))
+        
         results = []
         
         for box in boxes:
@@ -2914,24 +2930,34 @@ class OCRTrainerModule(QWidget):
                 
                 # Extract anchor text
                 for anchor in anchors:
-                    rect = fitz.Rect(
-                        anchor.rect.x() / self.zoom_scale,
-                        anchor.rect.y() / self.zoom_scale,
-                        (anchor.rect.x() + anchor.rect.width()) / self.zoom_scale,
-                        (anchor.rect.y() + anchor.rect.height()) / self.zoom_scale
+                    vis_x = anchor.rect.x() / self.zoom_scale
+                    vis_y = anchor.rect.y() / self.zoom_scale
+                    vis_w = anchor.rect.width() / self.zoom_scale
+                    vis_h = anchor.rect.height() / self.zoom_scale
+                    
+                    # Transform to PDF coordinates
+                    pdf_x, pdf_y, pdf_w, pdf_h = self.transform_visual_to_pdf_coords(
+                        vis_x, vis_y, vis_w, vis_h, page_width, page_height, rotation
                     )
+                    
+                    rect = fitz.Rect(pdf_x, pdf_y, pdf_x + pdf_w, pdf_y + pdf_h)
                     text = page.get_text("text", clip=rect).strip()
                     if text:
                         anchor_text += text + " "
                 
                 # Extract value text
                 for val in values_boxes:
-                    rect = fitz.Rect(
-                        val.rect.x() / self.zoom_scale,
-                        val.rect.y() / self.zoom_scale,
-                        (val.rect.x() + val.rect.width()) / self.zoom_scale,
-                        (val.rect.y() + val.rect.height()) / self.zoom_scale
+                    vis_x = val.rect.x() / self.zoom_scale
+                    vis_y = val.rect.y() / self.zoom_scale
+                    vis_w = val.rect.width() / self.zoom_scale
+                    vis_h = val.rect.height() / self.zoom_scale
+                    
+                    # Transform to PDF coordinates
+                    pdf_x, pdf_y, pdf_w, pdf_h = self.transform_visual_to_pdf_coords(
+                        vis_x, vis_y, vis_w, vis_h, page_width, page_height, rotation
                     )
+                    
+                    rect = fitz.Rect(pdf_x, pdf_y, pdf_x + pdf_w, pdf_y + pdf_h)
                     text = page.get_text("text", clip=rect).strip()
                     if text:
                         value_text += text + " "
@@ -2945,7 +2971,7 @@ class OCRTrainerModule(QWidget):
         
         # Show results in a message box
         if results:
-            result_text = "TEST EXTRACTION RESULTS:\n\n"
+            result_text = f"TEST EXTRACTION RESULTS (Page rotation: {rotation}°):\n\n"
             for r in results:
                 result_text += f"📦 Label: {r['label']}\n"
                 result_text += f"   🎯 Anchor: {r['anchor']}\n"
@@ -3067,6 +3093,7 @@ class OCRTrainerModule(QWidget):
             
             filename, doc, path = self.loaded_pdfs[pdf_idx]
             page_width, page_height = self.page_dimensions[(pdf_idx, page_idx)]
+            page_rotation = self.page_rotations.get((pdf_idx, page_idx), 0)
             
             ocr_page = OCRPage(
                 template_id=template.id,
@@ -3074,6 +3101,7 @@ class OCRTrainerModule(QWidget):
                 page_number=page_idx,
                 page_width=page_width,
                 page_height=page_height,
+                page_rotation=page_rotation,
                 order_index=order_idx
             )
             session.add(ocr_page)
@@ -3090,9 +3118,62 @@ class OCRTrainerModule(QWidget):
         QMessageBox.information(self, "Success", f"Template '{name}' saved!")
         self.load_template_list()
     
+    def transform_visual_to_pdf_coords(self, x, y, w, h, page_width, page_height, rotation):
+        """
+        Transform visual coordinates (what user sees/draws) to PDF internal coordinates.
+        The visual display is already derotated by PyMuPDF, so we need to reverse that
+        when working with the PDF's internal coordinate system.
+        
+        For a page rotated 90° anti-clockwise (rotation=90):
+        - Visual shows it correctly rotated
+        - User draws on the visual
+        - We need to store coordinates that work when the rotation is removed
+        """
+        if rotation == 0:
+            return x, y, w, h
+        elif rotation == 90:
+            # 90° anti-clockwise: visual (x, y) -> PDF (y, page_width - x - w)
+            # Dimensions swap: w, h -> h, w
+            new_x = y
+            new_y = page_width - x - w
+            new_w = h
+            new_h = w
+            return new_x, new_y, new_w, new_h
+        elif rotation == 180:
+            # 180°: visual (x, y) -> PDF (page_width - x - w, page_height - y - h)
+            new_x = page_width - x - w
+            new_y = page_height - y - h
+            return new_x, new_y, w, h
+        elif rotation == 270:
+            # 270° (or 90° clockwise): visual (x, y) -> PDF (page_height - y - h, x)
+            new_x = page_height - y - h
+            new_y = x
+            new_w = h
+            new_h = w
+            return new_x, new_y, new_w, new_h
+        else:
+            return x, y, w, h
+    
     def _save_box_to_db(self, session, page_id, box, parent_id, pdf_idx=None, page_idx=None):
         """Recursively save box and its children, extracting anchor text from PDF"""
         scale = self.canvas.scale_factor
+        
+        # Get page info
+        key = (pdf_idx, page_idx) if pdf_idx is not None and page_idx is not None else None
+        rotation = self.page_rotations.get(key, 0) if key else 0
+        page_dims = self.page_dimensions.get(key, (0, 0)) if key else (0, 0)
+        page_width, page_height = page_dims
+        
+        # Get visual coordinates (scaled back to PDF size)
+        vis_x = box.rect.x() / scale
+        vis_y = box.rect.y() / scale
+        vis_w = box.rect.width() / scale
+        vis_h = box.rect.height() / scale
+        
+        # Transform visual coordinates to PDF internal coordinates based on rotation
+        pdf_x, pdf_y, pdf_w, pdf_h = self.transform_visual_to_pdf_coords(
+            vis_x, vis_y, vis_w, vis_h, page_width, page_height, rotation
+        )
         
         # Get the actual text for anchor boxes from the PDF
         box_name = box.name
@@ -3101,13 +3182,8 @@ class OCRTrainerModule(QWidget):
             filename, doc, path = self.loaded_pdfs[pdf_idx]
             page = doc.load_page(page_idx)
             
-            # Get text from the anchor region
-            rect = fitz.Rect(
-                box.rect.x() / scale,
-                box.rect.y() / scale,
-                (box.rect.x() + box.rect.width()) / scale,
-                (box.rect.y() + box.rect.height()) / scale
-            )
+            # Use visual coordinates for text extraction (PyMuPDF handles rotation)
+            rect = fitz.Rect(vis_x, vis_y, vis_x + vis_w, vis_y + vis_h)
             extracted_text = page.get_text("text", clip=rect).strip()
             if extracted_text:
                 # Store the extracted text as the name (for searching later)
@@ -3118,10 +3194,10 @@ class OCRTrainerModule(QWidget):
             parent_box_id=parent_id,
             name=box_name,
             box_type=box.box_type,
-            x=box.rect.x() / scale,
-            y=box.rect.y() / scale,
-            width=box.rect.width() / scale,
-            height=box.rect.height() / scale
+            x=pdf_x,
+            y=pdf_y,
+            width=pdf_w,
+            height=pdf_h
         )
         session.add(db_box)
         session.commit()
