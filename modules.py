@@ -3076,7 +3076,7 @@ class OCRTrainerModule(QWidget):
             session.close()
     
     def _find_box_on_pages(self, doc, label_box, anchors, values, base_width, base_height):
-        """Find box content across all pages by searching for anchor text with OCR support"""
+        """Find box content across all pages by searching for anchor text with proper rotation handling"""
         
         if not anchors:
             return None
@@ -3107,33 +3107,40 @@ class OCRTrainerModule(QWidget):
         for page_idx in range(len(doc)):
             try:
                 page = doc.load_page(page_idx)
-                page_rect = page.rect
-                rotation = page.rotation  # Get page rotation (0, 90, 180, 270)
                 
-                # First try: Direct text search
+                # Get the rotation-normalized rectangle (what the page looks like without rotation)
+                # Use rotation_matrix to work in the visual coordinate system
+                rotation = page.rotation
+                
+                # For text extraction, we work in the derotated coordinate space
+                # page.rect gives us the rotated dimensions, we need unrotated for proper text search
+                
+                # First try: Direct text search (PyMuPDF handles rotation internally for search)
                 text_instances = page.search_for(anchor_search_text)
                 
                 # Second try: Search with just the first few words (partial match)
-                if not text_instances:
-                    words = anchor_search_text.split()
-                    if len(words) > 1:
-                        # Try searching for first word only
-                        text_instances = page.search_for(words[0])
+                words = anchor_search_text.split()
+                if not text_instances and len(words) > 1:
+                    text_instances = page.search_for(words[0])
                 
                 # Third try: Get all text blocks and search manually
                 if not text_instances:
-                    text_blocks = page.get_text("blocks")  # Returns list of text blocks
-                    for block in text_blocks:
-                        if len(block) >= 5:  # block format: (x0, y0, x1, y1, text, block_no, block_type)
-                            block_text = str(block[4]).strip() if len(block) > 4 else ""
-                            # Check if anchor text is in this block (case-insensitive)
-                            if anchor_search_text.lower() in block_text.lower():
-                                text_instances = [fitz.Rect(block[0], block[1], block[2], block[3])]
-                                break
-                            # Try partial match with first word
-                            if words and words[0].lower() in block_text.lower():
-                                text_instances = [fitz.Rect(block[0], block[1], block[2], block[3])]
-                                break
+                    # Get text with rotation handled - use "dict" format for more control
+                    text_dict = page.get_text("dict", flags=fitz.TEXT_PRESERVE_WHITESPACE)
+                    for block in text_dict.get("blocks", []):
+                        if block.get("type") == 0:  # Text block
+                            for line in block.get("lines", []):
+                                line_text = "".join([span.get("text", "") for span in line.get("spans", [])])
+                                if anchor_search_text.lower() in line_text.lower():
+                                    bbox = line.get("bbox", (0, 0, 0, 0))
+                                    text_instances = [fitz.Rect(bbox)]
+                                    break
+                                if words and words[0].lower() in line_text.lower():
+                                    bbox = line.get("bbox", (0, 0, 0, 0))
+                                    text_instances = [fitz.Rect(bbox)]
+                                    break
+                        if text_instances:
+                            break
                 
                 if text_instances:
                     # Found anchor! Use the first instance
@@ -3142,59 +3149,39 @@ class OCRTrainerModule(QWidget):
                     
                     value_text = ""
                     
+                    # Get page dimensions for scaling
+                    # Use the actual visible page size (after rotation is applied visually)
+                    page_width = page.rect.width
+                    page_height = page.rect.height
+                    
                     # Extract value based on relative offset from anchor
                     for offset in value_offsets:
                         # Calculate value rect position relative to anchor
-                        # Adjust for page rotation if needed
-                        if rotation == 0:
-                            value_rect = fitz.Rect(
-                                anchor_rect.x0 + (offset['dx'] * page_rect.width),
-                                anchor_rect.y0 + (offset['dy'] * page_rect.height),
-                                anchor_rect.x0 + (offset['dx'] * page_rect.width) + (offset['width'] * page_rect.width),
-                                anchor_rect.y0 + (offset['dy'] * page_rect.height) + (offset['height'] * page_rect.height)
-                            )
-                        elif rotation == 90:
-                            # Swap x/y for 90 degree rotation
-                            value_rect = fitz.Rect(
-                                anchor_rect.x0 - (offset['dy'] * page_rect.width),
-                                anchor_rect.y0 + (offset['dx'] * page_rect.height),
-                                anchor_rect.x0 - (offset['dy'] * page_rect.width) + (offset['height'] * page_rect.width),
-                                anchor_rect.y0 + (offset['dx'] * page_rect.height) + (offset['width'] * page_rect.height)
-                            )
-                        elif rotation == 180:
-                            value_rect = fitz.Rect(
-                                anchor_rect.x0 - (offset['dx'] * page_rect.width) - (offset['width'] * page_rect.width),
-                                anchor_rect.y0 - (offset['dy'] * page_rect.height) - (offset['height'] * page_rect.height),
-                                anchor_rect.x0 - (offset['dx'] * page_rect.width),
-                                anchor_rect.y0 - (offset['dy'] * page_rect.height)
-                            )
-                        elif rotation == 270:
-                            value_rect = fitz.Rect(
-                                anchor_rect.x0 + (offset['dy'] * page_rect.width),
-                                anchor_rect.y0 - (offset['dx'] * page_rect.height) - (offset['width'] * page_rect.height),
-                                anchor_rect.x0 + (offset['dy'] * page_rect.width) + (offset['height'] * page_rect.width),
-                                anchor_rect.y0 - (offset['dx'] * page_rect.height)
-                            )
-                        else:
-                            # Default to no rotation
-                            value_rect = fitz.Rect(
-                                anchor_rect.x0 + (offset['dx'] * page_rect.width),
-                                anchor_rect.y0 + (offset['dy'] * page_rect.height),
-                                anchor_rect.x0 + (offset['dx'] * page_rect.width) + (offset['width'] * page_rect.width),
-                                anchor_rect.y0 + (offset['dy'] * page_rect.height) + (offset['height'] * page_rect.height)
-                            )
+                        # Use simple offset calculation - the anchor_rect is already in the correct space
+                        value_rect = fitz.Rect(
+                            anchor_rect.x0 + (offset['dx'] * base_width),
+                            anchor_rect.y0 + (offset['dy'] * base_height),
+                            anchor_rect.x0 + (offset['dx'] * base_width) + (offset['width'] * base_width),
+                            anchor_rect.y0 + (offset['dy'] * base_height) + (offset['height'] * base_height)
+                        )
                         
-                        # Normalize the rect
+                        # Normalize the rect to ensure valid coordinates
                         value_rect = value_rect.normalize()
                         
-                        # Make sure the rect is within page bounds
-                        value_rect = value_rect & page_rect
+                        # Clip to page bounds
+                        value_rect = value_rect & page.rect
                         
                         if not value_rect.is_empty:
                             # Try to get text from the value region
                             text = page.get_text("text", clip=value_rect).strip()
                             
-                            # If no text found, try getting text blocks in that area
+                            # If no text found, try with slightly expanded rect
+                            if not text:
+                                expanded_rect = value_rect + (-5, -5, 5, 5)
+                                expanded_rect = expanded_rect & page.rect
+                                text = page.get_text("text", clip=expanded_rect).strip()
+                            
+                            # If still no text, try getting text blocks
                             if not text:
                                 blocks = page.get_text("blocks", clip=value_rect)
                                 for block in blocks:
@@ -3216,6 +3203,8 @@ class OCRTrainerModule(QWidget):
             except Exception as e:
                 # Log error but continue to next page
                 print(f"Error processing page {page_idx}: {e}")
+                import traceback
+                traceback.print_exc()
                 continue
         
         return None
