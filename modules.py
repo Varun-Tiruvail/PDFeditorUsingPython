@@ -3472,128 +3472,158 @@ class OCRTrainerModule(QWidget):
             session.close()
     
     def _find_box_on_pages(self, doc, label_box, anchors, values, base_width, base_height, template_rotation=0):
-        """Find box content across all pages by searching for anchor text with proper rotation handling"""
+        """
+        Find box content using MULTI-ANCHOR approach.
+        
+        When anchor text appears multiple times in a document, we use additional anchors
+        to disambiguate and find the correct instance:
+        1. Find all instances of the PRIMARY anchor (first anchor in list)
+        2. For each instance, check if SECONDARY anchors are at expected relative positions
+        3. If all anchors match (within tolerance), extract value at stored offset
+        
+        This allows extraction to work even when anchor text like "Name:" appears multiple times.
+        """
+        POSITION_TOLERANCE = 50  # pixels tolerance for anchor position matching
         
         if not anchors:
             return None
         
-        # Get the anchor text that was saved during template creation
-        anchor_search_text = ""
-        for anchor in anchors:
-            anchor_search_text += (anchor.name or "") + " "
-        anchor_search_text = anchor_search_text.strip()
-        
-        print(f"[DEBUG] Searching for anchor text: '{anchor_search_text}'")
-        
-        if not anchor_search_text:
-            print("[DEBUG] No anchor search text found!")
-            return None
-        
-        # Get the first anchor and first value for offset calculation
-        # These are in the STORED (transformed) coordinate space
+        # Get first anchor and value for primary matching
         first_anchor = anchors[0] if anchors else None
         first_value = values[0] if values else None
         
-        # Search all pages for the anchor text
+        if not first_anchor or not first_value:
+            return None
+        
+        # Primary anchor text (what we search for)
+        primary_anchor_text = (first_anchor.name or "").strip()
+        if not primary_anchor_text:
+            return None
+        
+        print(f"[DEBUG] Multi-anchor search: primary='{primary_anchor_text}'")
+        
+        # Build list of secondary anchors with their expected offsets from primary
+        secondary_anchors = []
+        for anchor in anchors[1:]:
+            anchor_text = (anchor.name or "").strip()
+            if anchor_text:
+                secondary_anchors.append({
+                    'text': anchor_text,
+                    'expected_dx': anchor.x - first_anchor.x,
+                    'expected_dy': anchor.y - first_anchor.y
+                })
+                print(f"[DEBUG] Secondary anchor: '{anchor_text}' at offset ({anchor.x - first_anchor.x:.1f}, {anchor.y - first_anchor.y:.1f})")
+        
+        # Calculate value offset from primary anchor
+        value_dx = first_value.x - first_anchor.x
+        value_dy = first_value.y - first_anchor.y
+        value_w = first_value.width
+        value_h = first_value.height
+        
+        print(f"[DEBUG] Value offset from primary: dx={value_dx:.1f}, dy={value_dy:.1f}, w={value_w:.1f}, h={value_h:.1f}")
+        
+        # Search all pages
         for page_idx in range(len(doc)):
             try:
                 page = doc.load_page(page_idx)
-                target_rotation = page.rotation  # 0, 90, 180, 270
                 
-                print(f"[DEBUG] Searching page {page_idx}, rotation={target_rotation}°")
+                # Find ALL instances of primary anchor
+                primary_instances = page.search_for(primary_anchor_text)
                 
-                # First try: Direct text search (PyMuPDF handles rotation internally)
-                text_instances = page.search_for(anchor_search_text)
+                # Fallback: search for first word if full text not found
+                if not primary_instances:
+                    words = primary_anchor_text.split()
+                    if words:
+                        primary_instances = page.search_for(words[0])
                 
-                # Second try: Search with just the first word (partial match)
-                words = anchor_search_text.split()
-                if not text_instances and len(words) > 0:
-                    text_instances = page.search_for(words[0])
+                if not primary_instances:
+                    continue
                 
-                # Third try: Get all text blocks and search manually
-                if not text_instances:
-                    text_dict = page.get_text("dict", flags=fitz.TEXT_PRESERVE_WHITESPACE)
-                    for block in text_dict.get("blocks", []):
-                        if block.get("type") == 0:  # Text block
-                            for line in block.get("lines", []):
-                                line_text = "".join([span.get("text", "") for span in line.get("spans", [])])
-                                if anchor_search_text.lower() in line_text.lower():
-                                    bbox = line.get("bbox", (0, 0, 0, 0))
-                                    text_instances = [fitz.Rect(bbox)]
-                                    break
-                                if words and words[0].lower() in line_text.lower():
-                                    bbox = line.get("bbox", (0, 0, 0, 0))
-                                    text_instances = [fitz.Rect(bbox)]
-                                    break
-                        if text_instances:
+                print(f"[DEBUG] Page {page_idx}: Found {len(primary_instances)} instance(s) of '{primary_anchor_text}'")
+                
+                # Check each primary instance
+                for primary_rect in primary_instances:
+                    print(f"[DEBUG] Checking primary at {primary_rect}")
+                    
+                    # If we have secondary anchors, verify they're at expected positions
+                    all_secondary_match = True
+                    
+                    for secondary in secondary_anchors:
+                        sec_text = secondary['text']
+                        expected_dx = secondary['expected_dx']
+                        expected_dy = secondary['expected_dy']
+                        
+                        # Find all instances of this secondary anchor
+                        sec_instances = page.search_for(sec_text)
+                        
+                        # Check if any instance is at expected offset (within tolerance)
+                        found_matching = False
+                        for sec_rect in sec_instances:
+                            actual_dx = sec_rect.x0 - primary_rect.x0
+                            actual_dy = sec_rect.y0 - primary_rect.y0
+                            
+                            dx_diff = abs(actual_dx - expected_dx)
+                            dy_diff = abs(actual_dy - expected_dy)
+                            
+                            if dx_diff <= POSITION_TOLERANCE and dy_diff <= POSITION_TOLERANCE:
+                                print(f"[DEBUG] Secondary '{sec_text}' matched at offset diff ({dx_diff:.1f}, {dy_diff:.1f})")
+                                found_matching = True
+                                break
+                        
+                        if not found_matching:
+                            print(f"[DEBUG] Secondary '{sec_text}' NOT found at expected offset")
+                            all_secondary_match = False
                             break
+                    
+                    # If all secondary anchors matched (or there are none), extract value
+                    if all_secondary_match:
+                        print(f"[DEBUG] All anchors matched! Extracting value...")
+                        
+                        # Calculate value rect
+                        value_rect = fitz.Rect(
+                            primary_rect.x0 + value_dx,
+                            primary_rect.y0 + value_dy,
+                            primary_rect.x0 + value_dx + value_w,
+                            primary_rect.y0 + value_dy + value_h
+                        )
+                        
+                        value_rect = value_rect.normalize()
+                        value_rect = value_rect & page.rect
+                        
+                        print(f"[DEBUG] Value rect: {value_rect}")
+                        
+                        value_text = ""
+                        if not value_rect.is_empty:
+                            # Try to get text from value region
+                            text = page.get_text("text", clip=value_rect).strip()
+                            
+                            # If no text, try expanded rect
+                            if not text:
+                                expanded = (value_rect + (-10, -10, 10, 10)) & page.rect
+                                text = page.get_text("text", clip=expanded).strip()
+                            
+                            # Fallback to text blocks
+                            if not text:
+                                blocks = page.get_text("blocks", clip=value_rect)
+                                for block in blocks:
+                                    if len(block) > 4:
+                                        text += str(block[4]).strip() + " "
+                                text = text.strip()
+                            
+                            if text:
+                                value_text = text
+                                print(f"[DEBUG] Extracted: '{value_text[:50]}'")
+                        
+                        if value_text:
+                            return {
+                                'page': page_idx,
+                                'anchor_text': primary_anchor_text,
+                                'value_text': value_text,
+                                'target_rotation': page.rotation
+                            }
                 
-                if text_instances and first_anchor and first_value:
-                    # Found anchor! Use the first instance
-                    anchor_rect = text_instances[0]
-                    anchor_text = anchor_search_text
-                    
-                    print(f"[DEBUG] Found anchor '{anchor_text[:30]}' at {anchor_rect} on page {page_idx}")
-                    
-                    # SIMPLIFIED APPROACH (tested with 100% pass rate on 224 test cases):
-                    # Both anchor and value coordinates are stored in RAW PDF space
-                    # search_for() also returns RAW PDF coordinates
-                    # So we can directly use the stored offset without any rotation transformation!
-                    
-                    # Calculate raw offset from stored raw coordinates
-                    raw_dx = first_value.x - first_anchor.x
-                    raw_dy = first_value.y - first_anchor.y
-                    raw_w = first_value.width
-                    raw_h = first_value.height
-                    
-                    print(f"[DEBUG] Raw offset (stored): dx={raw_dx:.1f}, dy={raw_dy:.1f}, w={raw_w:.1f}, h={raw_h:.1f}")
-                    
-                    # Calculate value rect directly in raw PDF space
-                    value_rect = fitz.Rect(
-                        anchor_rect.x0 + raw_dx,
-                        anchor_rect.y0 + raw_dy,
-                        anchor_rect.x0 + raw_dx + raw_w,
-                        anchor_rect.y0 + raw_dy + raw_h
-                    )
-                    
-                    print(f"[DEBUG] Value rect: {value_rect}")
-                    
-                    # Normalize and clip to page
-                    value_rect = value_rect.normalize()
-                    value_rect = value_rect & page.rect
-                    
-                    value_text = ""
-                    if not value_rect.is_empty:
-                        # Try to get text from the value region
-                        text = page.get_text("text", clip=value_rect).strip()
-                        
-                        # If no text found, try with expanded rect
-                        if not text:
-                            expanded_rect = value_rect + (-10, -10, 10, 10)
-                            expanded_rect = expanded_rect & page.rect
-                            text = page.get_text("text", clip=expanded_rect).strip()
-                        
-                        # If still no text, try getting text blocks
-                        if not text:
-                            blocks = page.get_text("blocks", clip=value_rect)
-                            for block in blocks:
-                                if len(block) > 4:
-                                    text += str(block[4]).strip() + " "
-                            text = text.strip()
-                        
-                        if text:
-                            value_text = text
-                            print(f"[DEBUG] Extracted value: '{value_text[:50]}...'")
-                    
-                    if value_text:
-                        return {
-                            'page': page_idx,
-                            'anchor_text': anchor_text,
-                            'value_text': value_text,
-                            'target_rotation': target_rotation
-                        }
             except Exception as e:
-                print(f"Error processing page {page_idx}: {e}")
+                print(f"[DEBUG] Error on page {page_idx}: {e}")
                 import traceback
                 traceback.print_exc()
                 continue
