@@ -139,6 +139,7 @@ class LabeledBox(Base):
     y = Column(Float)
     width = Column(Float)
     height = Column(Float)
+    anchor_text = Column(String, nullable=True)  # OCR-captured text for anchor boxes
     page = relationship("OCRPage", back_populates="boxes")
     # Self-referential relationship: parent has many children
     children = relationship("LabeledBox", 
@@ -2249,6 +2250,7 @@ class OCRBox:
         self.parent = parent  # Parent OCRBox for anchor/value
         self.children = []  # Child boxes (anchors/values)
         self.id = None  # Database ID, set after saving
+        self.anchor_text = ""  # OCR-captured text inside anchor box
     
     def add_child(self, child):
         child.parent = self

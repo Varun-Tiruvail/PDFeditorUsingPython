@@ -542,6 +542,50 @@ class OCRImageTrainerModule(QWidget):
         
         return canvas_box
     
+    def _ocr_inside_rect(self, rect_ocr_coords):
+        """Run OCR only inside a specific rectangle (in OCR coordinates).
+        Returns the extracted text from inside the box.
+        """
+        if not EASYOCR_AVAILABLE:
+            return ""
+        
+        if self.current_pdf_index < 0 or not self.loaded_pdfs:
+            return ""
+        
+        filename, doc, path = self.loaded_pdfs[self.current_pdf_index]
+        page = doc.load_page(self.current_page_index)
+        
+        try:
+            # Convert page to image at OCR DPI
+            pil_image = self._page_to_image(page)
+            
+            # Crop to the specified rectangle
+            x1 = max(0, int(rect_ocr_coords.x()))
+            y1 = max(0, int(rect_ocr_coords.y()))
+            x2 = min(pil_image.width, int(rect_ocr_coords.x() + rect_ocr_coords.width()))
+            y2 = min(pil_image.height, int(rect_ocr_coords.y() + rect_ocr_coords.height()))
+            
+            if x2 <= x1 or y2 <= y1:
+                return ""
+            
+            cropped = pil_image.crop((x1, y1, x2, y2))
+            img_array = np.array(cropped)
+            
+            # Run OCR on cropped region
+            reader = get_ocr_reader()
+            if reader is None:
+                return ""
+            
+            ocr_results = reader.readtext(img_array)
+            
+            # Combine all detected text
+            texts = [text.strip() for bbox, text, conf in ocr_results if text.strip()]
+            return " ".join(texts)
+            
+        except Exception as e:
+            print(f"[OCR Error] _ocr_inside_rect: {e}")
+            return ""
+    
     # =================== Zoom Controls ===================
     
     def update_zoom_label(self):
@@ -613,7 +657,22 @@ class OCRImageTrainerModule(QWidget):
         self.canvas.set_mode(mode)
     
     def on_box_created(self, box):
-        """Handle new box creation"""
+        """Handle new box creation - auto-OCR anchor boxes to capture text"""
+        # If this is an anchor box, run OCR inside it to capture the text
+        if box.box_type == 'anchor' and EASYOCR_AVAILABLE:
+            # Convert to OCR coordinates first
+            ocr_box = self._scale_box_to_ocr_coords(box)
+            anchor_text = self._ocr_inside_rect(ocr_box.rect)
+            if anchor_text:
+                box.anchor_text = anchor_text
+                # Update box name to show captured text
+                short_text = anchor_text[:20] + "..." if len(anchor_text) > 20 else anchor_text
+                box.name = f"Anchor: {short_text}"
+                QMessageBox.information(self, "Anchor Captured", 
+                    f"Captured anchor text:\n\"{anchor_text}\"")
+            else:
+                QMessageBox.warning(self, "No Text Found", 
+                    "No text detected in anchor box. Try drawing a larger box.")
         self.update_box_list()
     
     def on_box_selected(self, box):
@@ -897,9 +956,9 @@ class OCRImageTrainerModule(QWidget):
         if not paths:
             return
         
-        if not TESSERACT_AVAILABLE:
+        if not EASYOCR_AVAILABLE:
             QMessageBox.warning(self, "OCR Not Available", 
-                "Tesseract OCR is not installed.")
+                "EasyOCR is not installed. Run: pip install easyocr")
             return
         
         session = SessionLocal()
