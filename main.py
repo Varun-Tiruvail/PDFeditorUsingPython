@@ -9,6 +9,7 @@ from PySide6.QtCore import Qt, QPoint
 from PySide6.QtGui import QFont
 
 from modules import PDFEditorModule, OCRTrainerModule, SchedulerModule, MailDrafterModule
+from ocr_module import OCRImageTrainerModule
 
 class CustomTitleBar(QWidget):
     """Custom draggable title bar with window controls"""
@@ -136,11 +137,13 @@ class MainWindow(QMainWindow):
         # Instantiate Modules
         self.pdf_module = PDFEditorModule()
         self.ocr_module = OCRTrainerModule()
+        self.ocr_image_module = OCRImageTrainerModule()  # New OCR for scanned images
         self.scheduler_module = SchedulerModule()
         self.mail_module = MailDrafterModule(self.pdf_module)
         
         self.content_stack.addWidget(self.pdf_module)
         self.content_stack.addWidget(self.ocr_module)
+        self.content_stack.addWidget(self.ocr_image_module)
         self.content_stack.addWidget(self.scheduler_module)
         self.content_stack.addWidget(self.mail_module)
         
@@ -170,8 +173,9 @@ class MainWindow(QMainWindow):
         modules = [
             ("📄 PDF Editor", 0),
             ("🔍 OCR Trainer", 1),
-            ("⏰ Scheduler", 2),
-            ("📧 Mail Drafter", 3), # Added Mail Drafter module
+            ("🔤 OCR Images", 2),  # New OCR for scanned images
+            ("⏰ Scheduler", 3),
+            ("📧 Mail Drafter", 4),
         ]
         
         for text, index in modules:

@@ -2726,6 +2726,12 @@ class OCRTrainerModule(QWidget):
         self.template_combo = QComboBox()
         left_panel.addWidget(self.template_combo)
         
+        # Load Template for Editing button
+        self.btn_load_template = QPushButton("📂 Load Template for Edit")
+        self.btn_load_template.clicked.connect(self.load_template_for_editing)
+        self.btn_load_template.setStyleSheet("background: #9C27B0; color: white; padding: 8px;")
+        left_panel.addWidget(self.btn_load_template)
+        
         extract_layout = QHBoxLayout()
         self.btn_run_extraction = QPushButton("▶️ Run Extraction")
         self.btn_run_extraction.clicked.connect(self.run_extraction)
@@ -2911,10 +2917,55 @@ class OCRTrainerModule(QWidget):
             self.render_current_page()
     
     def save_current_page_boxes(self):
-        """Save boxes from canvas to page_boxes dict"""
+        """Save boxes from canvas to page_boxes dict in PDF coordinates (scale=1.0)
+        
+        Boxes on canvas are drawn at current zoom scale. We convert them back to
+        PDF coords so they can be correctly rescaled when zoom changes.
+        """
         if self.current_pdf_index >= 0:
             key = (self.current_pdf_index, self.current_page_index)
-            self.page_boxes[key] = list(self.canvas.boxes)
+            # Deep copy boxes and convert to PDF coordinates
+            pdf_boxes = []
+            for box in self.canvas.boxes:
+                pdf_box = self._scale_box_to_pdf_coords(box)
+                pdf_boxes.append(pdf_box)
+            self.page_boxes[key] = pdf_boxes
+    
+    def _scale_box_to_pdf_coords(self, box):
+        """Convert box from canvas coords (scaled) to PDF coords (scale=1.0)"""
+        scale = self.zoom_scale
+        pdf_rect = QRectF(
+            box.rect.x() / scale,
+            box.rect.y() / scale,
+            box.rect.width() / scale,
+            box.rect.height() / scale
+        )
+        pdf_box = OCRBox(pdf_rect, box.name, box.box_type, box.parent)
+        pdf_box.id = box.id
+        # Recursively convert children
+        for child in box.children:
+            pdf_child = self._scale_box_to_pdf_coords(child)
+            pdf_child.parent = pdf_box
+            pdf_box.children.append(pdf_child)
+        return pdf_box
+    
+    def _scale_box_to_canvas_coords(self, box):
+        """Convert box from PDF coords (scale=1.0) to canvas coords (scaled)"""
+        scale = self.zoom_scale
+        canvas_rect = QRectF(
+            box.rect.x() * scale,
+            box.rect.y() * scale,
+            box.rect.width() * scale,
+            box.rect.height() * scale
+        )
+        canvas_box = OCRBox(canvas_rect, box.name, box.box_type, box.parent)
+        canvas_box.id = box.id
+        # Recursively convert children
+        for child in box.children:
+            canvas_child = self._scale_box_to_canvas_coords(child)
+            canvas_child.parent = canvas_box
+            canvas_box.children.append(canvas_child)
+        return canvas_box
     
     def render_current_page(self):
         """Render current page and load its boxes"""
@@ -2943,9 +2994,15 @@ class OCRTrainerModule(QWidget):
         
         self.canvas.set_image(pixmap, scale_factor=self.zoom_scale)
         
-        # Load boxes for this page
+        # Load boxes for this page (scale from PDF coords to canvas coords)
         if key in self.page_boxes:
-            self.canvas.set_boxes(self.page_boxes[key])
+            scaled_boxes = []
+            for box in self.page_boxes[key]:
+                scaled_box = self._scale_box_to_canvas_coords(box)
+                scaled_boxes.append(scaled_box)
+            self.canvas.set_boxes(scaled_boxes)
+        else:
+            self.canvas.set_boxes([])
         
         self.update_box_list()
         self.update_zoom_label()
@@ -2995,6 +3052,9 @@ class OCRTrainerModule(QWidget):
         if self.current_pdf_index < 0 or not self.loaded_pdfs:
             return
         
+        # Save current boxes to page_boxes (in PDF coords) before zoom changes
+        self.save_current_page_boxes()
+        
         filename, doc, path = self.loaded_pdfs[self.current_pdf_index]
         page = doc.load_page(self.current_page_index)
         
@@ -3006,10 +3066,16 @@ class OCRTrainerModule(QWidget):
         self.canvas.set_image(pixmap, scale_factor=self.zoom_scale)
         self.update_zoom_label()
         
-        # Rescale boxes to match new zoom
+        # Reload boxes at new zoom scale
         key = (self.current_pdf_index, self.current_page_index)
         if key in self.page_boxes:
-            self.canvas.set_boxes(self.page_boxes[key])
+            scaled_boxes = []
+            for box in self.page_boxes[key]:
+                scaled_box = self._scale_box_to_canvas_coords(box)
+                scaled_boxes.append(scaled_box)
+            self.canvas.set_boxes(scaled_boxes)
+        else:
+            self.canvas.set_boxes([])
         self.canvas.update()
     
     def test_extract_current(self):
@@ -3174,6 +3240,93 @@ class OCRTrainerModule(QWidget):
         for t in templates:
             self.template_combo.addItem(t.name, t.id)
         session.close()
+    
+    def load_template_for_editing(self):
+        """Load an existing template's boxes onto the current PDF page for editing.
+        
+        This allows adding new labels/anchors to existing templates.
+        The template works on ANY loaded PDF - boxes are position-based patterns.
+        """
+        if self.current_pdf_index < 0 or not self.loaded_pdfs:
+            QMessageBox.warning(self, "No PDF", "Please load a PDF first.")
+            return
+        
+        template_id = self.template_combo.currentData()
+        template_name = self.template_combo.currentText()
+        
+        if not template_id:
+            QMessageBox.warning(self, "No Template", "Please select a template to load.")
+            return
+        
+        session = SessionLocal()
+        template = session.query(OCRTemplate).filter(OCRTemplate.id == template_id).first()
+        
+        if not template:
+            QMessageBox.warning(self, "Error", "Template not found.")
+            session.close()
+            return
+        
+        # Clear current boxes
+        self.page_boxes.clear()
+        self.canvas.clear_boxes()
+        
+        # Load boxes from template
+        loaded_count = 0
+        current_key = (self.current_pdf_index, self.current_page_index)
+        current_page_rotation = self.page_rotations.get(current_key, 0)
+        
+        for ocr_page in template.pages:
+            # Get stored page info
+            stored_rotation = getattr(ocr_page, 'page_rotation', 0) or 0
+            
+            # Load label boxes for this page
+            label_boxes = session.query(LabeledBox).filter(
+                LabeledBox.page_id == ocr_page.id,
+                LabeledBox.box_type == 'label'
+            ).all()
+            
+            for db_label in label_boxes:
+                # Create OCRBox from database - coords are stored in raw PDF space
+                label_box = self._db_box_to_ocr_box(db_label, stored_rotation, current_page_rotation)
+                
+                # Add to page_boxes (in PDF coords, scale=1.0)
+                if current_key not in self.page_boxes:
+                    self.page_boxes[current_key] = []
+                self.page_boxes[current_key].append(label_box)
+                loaded_count += 1
+        
+        session.close()
+        
+        # Set template name for easy update
+        self.template_name_input.setText(template_name)
+        
+        # Reload page to display boxes
+        self.render_current_page()
+        self.update_box_list()
+        
+        QMessageBox.information(self, "Loaded", 
+            f"Loaded {loaded_count} label boxes from '{template_name}'.\n"
+            f"Add new boxes and click 'Save Template' to update.")
+    
+    def _db_box_to_ocr_box(self, db_box, stored_rotation, current_rotation):
+        """Convert a database LabeledBox to an OCRBox.
+        
+        Stored coordinates are in RAW PDF space. We load them directly since
+        we're storing in PDF coords (scale=1.0) before display scaling.
+        """
+        # Create rect from stored coords (these are raw PDF coords)
+        rect = QRectF(db_box.x, db_box.y, db_box.width, db_box.height)
+        
+        ocr_box = OCRBox(rect, db_box.name, db_box.box_type)
+        ocr_box.id = db_box.id
+        
+        # Recursively load children
+        for child_db in db_box.children:
+            child_box = self._db_box_to_ocr_box(child_db, stored_rotation, current_rotation)
+            child_box.parent = ocr_box
+            ocr_box.children.append(child_box)
+        
+        return ocr_box
     
     def save_template(self):
         """Save current template to database"""
@@ -3419,6 +3572,7 @@ class OCRTrainerModule(QWidget):
         self.result_table.setHorizontalHeaderLabels(columns)
         
         self.extraction_results = []
+        self.extraction_screenshots = []  # Collect for backup PDF
         extracted_count = 0
         
         try:
@@ -3442,6 +3596,17 @@ class OCRTrainerModule(QWidget):
                         row_data[f"{label['name']}_Anchor"] = match['anchor_text']
                         row_data[f"{label['name']}_Value"] = match['value_text']
                         extracted_count += 1
+                        
+                        # Collect screenshot data for backup PDF
+                        if 'value_rect' in match and match['value_rect']:
+                            self.extraction_screenshots.append({
+                                'pdf_path': pdf_path,
+                                'page_idx': match['page'],
+                                'value_rect': match['value_rect'],
+                                'label_name': label['name'],
+                                'value_text': match['value_text'],
+                                'pdf_filename': pdf_filename
+                            })
                     else:
                         row_data[f"{label['name']}_Anchor"] = ""
                         row_data[f"{label['name']}_Value"] = ""
@@ -3461,6 +3626,10 @@ class OCRTrainerModule(QWidget):
             # Resize columns to fit content
             self.result_table.resizeColumnsToContents()
             
+            # Generate extraction backup PDF automatically
+            if self.extraction_screenshots:
+                self._generate_extraction_backup()
+            
             QMessageBox.information(self, "Complete", 
                 f"Extraction complete!\n{len(paths)} PDFs processed\n{extracted_count} values extracted")
             
@@ -3470,6 +3639,75 @@ class OCRTrainerModule(QWidget):
             traceback.print_exc()
         finally:
             session.close()
+    
+    def _generate_extraction_backup(self):
+        """Generate backup PDF with screenshots of extracted values from processed PDFs"""
+        if not self.extraction_screenshots:
+            return
+        
+        # Ask user where to save
+        path, _ = QFileDialog.getSaveFileName(self, "Save Extraction Backup PDF", 
+            "extraction_backup.pdf", "PDF Files (*.pdf)")
+        if not path:
+            return
+        
+        try:
+            backup_doc = fitz.open()
+            
+            for data in self.extraction_screenshots:
+                pdf_path = data['pdf_path']
+                page_idx = data['page_idx']
+                value_rect = data['value_rect']
+                label_name = data['label_name']
+                value_text = data['value_text']
+                pdf_filename = data['pdf_filename']
+                
+                # Open source PDF and get page
+                src_doc = fitz.open(pdf_path)
+                src_page = src_doc.load_page(page_idx)
+                
+                # Expand rect a bit for context
+                expanded_rect = value_rect + (-20, -20, 20, 20)
+                expanded_rect = expanded_rect & src_page.rect  # Clip to page bounds
+                
+                # Get cropped screenshot (scale 2x for quality)
+                mat = fitz.Matrix(2, 2)
+                pix = src_page.get_pixmap(matrix=mat, clip=expanded_rect)
+                
+                # Create new page in backup doc
+                # Page size: cropped image width + margins, enough height for image + text
+                img_width = pix.width
+                img_height = pix.height
+                page_width = img_width + 40  # 20px margins
+                page_height = img_height + 120  # Space for header/footer text
+                
+                backup_page = backup_doc.new_page(width=page_width, height=page_height)
+                
+                # Add header text
+                header_text = f"Source: {pdf_filename} | Page: {page_idx + 1} | Label: {label_name}"
+                text_point = fitz.Point(20, 25)
+                backup_page.insert_text(text_point, header_text, fontsize=10)
+                
+                # Insert the cropped image
+                img_rect = fitz.Rect(20, 40, 20 + img_width, 40 + img_height)
+                backup_page.insert_image(img_rect, pixmap=pix)
+                
+                # Add extracted text at bottom
+                text_y = 40 + img_height + 20
+                value_preview = value_text[:100] + "..." if len(value_text) > 100 else value_text
+                backup_page.insert_text(fitz.Point(20, text_y), f"Value: {value_preview}", fontsize=9)
+                
+                src_doc.close()
+            
+            backup_doc.save(path)
+            backup_doc.close()
+            
+            print(f"[DEBUG] Extraction backup saved to: {path}")
+            
+        except Exception as e:
+            print(f"[DEBUG] Error generating extraction backup: {e}")
+            import traceback
+            traceback.print_exc()
     
     def _find_box_on_pages(self, doc, label_box, anchors, values, base_width, base_height, template_rotation=0):
         """
@@ -3619,6 +3857,7 @@ class OCRTrainerModule(QWidget):
                                 'page': page_idx,
                                 'anchor_text': primary_anchor_text,
                                 'value_text': value_text,
+                                'value_rect': value_rect,  # For extraction backup screenshots
                                 'target_rotation': page.rotation
                             }
                 
